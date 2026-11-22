@@ -67,6 +67,7 @@ export async function buildRestorePlan(
   packageSelectionId: string,
   destinationSelectionId: string,
   conflictResolution?: FileConflictResolution,
+  copyConflictingConversations = false,
 ): Promise<RestorePlan> {
   const response = await invoke<{
     action: "plan";
@@ -80,6 +81,7 @@ export async function buildRestorePlan(
         package_selection_id: packageSelectionId,
         destination_selection_id: destinationSelectionId,
         conflict_resolution: conflictResolution,
+        ...(copyConflictingConversations ? { copy_conflicting_conversations: true } : {}),
       },
     },
   );

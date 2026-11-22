@@ -146,6 +146,109 @@ fn selected_sidebar_and_ownership_round_trip_preserves_local_and_deferred_record
 }
 
 #[test]
+fn importing_selected_members_preserves_shared_target_group_name_and_appearance(
+) -> Result<(), Box<dyn Error>> {
+    for (target_name, target_appearance, clear_source_appearance) in [
+        ("目标共享组", Some("{\"icon\":\"local\"}"), false),
+        ("开发记录", Some("{\"icon\":\"local\"}"), false),
+        ("开发记录", Some("{\"icon\":\"local\"}"), true),
+    ] {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state_5.sqlite");
+        let db = database(&path)?;
+        db.execute(
+            "INSERT INTO thread_sections(id,name,appearance) VALUES (?1,?2,?3)",
+            (SECTION, target_name, target_appearance),
+        )?;
+        db.execute(
+            "UPDATE threads SET thread_section_id=?1 WHERE id=?2",
+            (SECTION, DEFERRED),
+        )?;
+        drop(db);
+        let mut incoming = metadata();
+        if clear_source_appearance {
+            incoming["_rehome_section"]["appearance"] = Value::Null;
+        }
+        let payload = serde_json::to_vec(&json!([incoming]))?;
+        let sessions = [session(THREAD, &root.path().join("sessions/thread.jsonl"))];
+        for _ in 0..2 {
+            assert_eq!(import_sqlite_threads(&path, &payload, &sessions, &[])?, 1);
+        }
+        let db = Connection::open(&path)?;
+        let actual = db.query_row(
+            "SELECT name,appearance FROM thread_sections WHERE id=?1",
+            [SECTION],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        assert_eq!(
+            actual,
+            (target_name.to_owned(), target_appearance.map(str::to_owned))
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT thread_section_id FROM threads WHERE id=?1",
+                [THREAD],
+                |row| row.get::<_, String>(0)
+            )?,
+            SECTION
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT title,thread_section_id,section_position FROM threads WHERE id=?1",
+                [DEFERRED],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?
+                ))
+            )?,
+            ("Local conversation".to_owned(), SECTION.to_owned(), 100)
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM thread_sections", [], |row| row
+                .get::<_, i64>(0))?,
+            2
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn group_rename_remains_supported_when_all_existing_members_are_selected(
+) -> Result<(), Box<dyn Error>> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("state_5.sqlite");
+    let db = database(&path)?;
+    db.execute(
+        "INSERT INTO thread_sections VALUES (?1,'Target group',NULL)",
+        [SECTION],
+    )?;
+    db.execute(
+        "UPDATE threads SET thread_section_id=?1 WHERE id=?2",
+        (SECTION, DEFERRED),
+    )?;
+    drop(db);
+    let mut second = metadata();
+    second["id"] = json!(DEFERRED);
+    let payload = serde_json::to_vec(&json!([metadata(), second]))?;
+    let sessions = [
+        session(THREAD, &root.path().join("one.jsonl")),
+        session(DEFERRED, &root.path().join("two.jsonl")),
+    ];
+    assert_eq!(import_sqlite_threads(&path, &payload, &sessions, &[])?, 2);
+    let db = Connection::open(&path)?;
+    assert_eq!(
+        db.query_row(
+            "SELECT name,appearance FROM thread_sections WHERE id=?1",
+            [SECTION],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        )?,
+        ("开发记录".to_owned(), "{\"icon\":\"code\"}".to_owned())
+    );
+    Ok(())
+}
+
+#[test]
 fn old_package_preserves_sidebar_and_explicit_null_membership_clears_only_selected_thread(
 ) -> Result<(), Box<dyn Error>> {
     let root = tempfile::tempdir()?;

@@ -1,5 +1,8 @@
 //! Selected conversations carry their sidebar state through the existing DB transaction.
-use super::error::{ErrorCode, RehomeError};
+use super::{
+    error::{ErrorCode, RehomeError},
+    models::PlannedSession,
+};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -155,6 +158,7 @@ pub(crate) fn validate_rows(rows: &[Map<String, Value>]) -> Result<(), RehomeErr
 pub(crate) fn prepare_import(
     db: &Connection,
     row: &mut Map<String, Value>,
+    sessions: &[PlannedSession],
 ) -> Result<(), RehomeError> {
     validate_thread_fields(row)?;
     let available = columns(db, "threads")?;
@@ -186,8 +190,14 @@ pub(crate) fn prepare_import(
     if !available.contains("id") || !available.contains("name") {
         return Err(failure("target thread section table is unavailable"));
     }
+    if has_unselected_members(db, section_id, sessions)? {
+        // 分组名称和外观属于所有成员；保留未选会话共享的目标组，仅恢复已选会话的归属。
+        let preserved = descriptor(db, section_id)?;
+        row.insert(DESCRIPTOR.to_owned(), preserved);
+        return Ok(());
+    }
     let name = section["name"].as_str().expect("validated section name");
-    // 同一账号沿用 section UUID；只更新已选会话引用的组，不删除目标独有组和成员。
+    // 空组或所有成员均在本次计划内时，仍可同步来源组的改名和外观。
     if let Some(appearance) = section.get("appearance") {
         if !available.contains("appearance") && !appearance.is_null() {
             return Err(failure(
@@ -207,6 +217,45 @@ pub(crate) fn prepare_import(
 pub(crate) fn verify_restored(
     db: &Connection,
     row: &Map<String, Value>,
+) -> Result<bool, RehomeError> {
+    verify_with_scope(db, row, None)
+}
+
+pub(crate) fn verify_restored_with_scope(
+    db: &Connection,
+    row: &Map<String, Value>,
+    sessions: &[PlannedSession],
+) -> Result<bool, RehomeError> {
+    verify_with_scope(db, row, Some(sessions))
+}
+
+fn has_unselected_members(
+    db: &Connection,
+    section_id: &str,
+    sessions: &[PlannedSession],
+) -> Result<bool, RehomeError> {
+    let selected = sessions
+        .iter()
+        .map(|session| session.target_task_id.to_string())
+        .collect::<HashSet<_>>();
+    let mut statement = db
+        .prepare("SELECT id FROM threads WHERE thread_section_id=?1")
+        .map_err(failure)?;
+    let members = statement
+        .query_map([section_id], |row| row.get::<_, String>(0))
+        .map_err(failure)?;
+    for member in members {
+        if !selected.contains(&member.map_err(failure)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_with_scope(
+    db: &Connection,
+    row: &Map<String, Value>,
+    sessions: Option<&[PlannedSession]>,
 ) -> Result<bool, RehomeError> {
     validate_thread_fields(row)?;
     let id = row
@@ -265,6 +314,11 @@ pub(crate) fn verify_restored(
             return Ok(false);
         }
         let actual = descriptor(db, id)?;
+        if let Some(sessions) = sessions {
+            if has_unselected_members(db, id, sessions)? {
+                return Ok(true);
+            }
+        }
         for (field, value) in expected {
             if field == "appearance" && value.is_null() && actual.get(field).is_none() {
                 continue;
@@ -275,4 +329,48 @@ pub(crate) fn verify_restored(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::models::SessionAction;
+    use std::path::PathBuf;
+
+    #[test]
+    fn reconstructed_source_metadata_verifies_preserved_shared_group_but_not_wrong_membership() {
+        let id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let section = "33333333-3333-4333-8333-333333333333";
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE thread_sections(id TEXT PRIMARY KEY,name TEXT NOT NULL,appearance TEXT);
+          CREATE TABLE threads(id TEXT PRIMARY KEY,thread_section_id TEXT,section_position INTEGER);
+          INSERT INTO thread_sections VALUES('33333333-3333-4333-8333-333333333333','Target shared group',NULL);
+          INSERT INTO threads VALUES('11111111-1111-4111-8111-111111111111','33333333-3333-4333-8333-333333333333',10);
+          INSERT INTO threads VALUES('22222222-2222-4222-8222-222222222222','33333333-3333-4333-8333-333333333333',20);").unwrap();
+        let sessions = [PlannedSession {
+            package_source: "codex/sessions/selected.jsonl".to_owned(),
+            target: PathBuf::from("/synthetic/sessions/selected.jsonl"),
+            source_task_id: id,
+            target_task_id: id,
+            title: "Selected".to_owned(),
+            source_content_hash: String::new(),
+            expected_final_content_hash: String::new(),
+            action: SessionAction::Import,
+        }];
+        let source = json!({"id":id,"thread_section_id":section,"section_position":10,
+          "_rehome_section":{"id":section,"name":"Source group","appearance":"{\"icon\":\"code\"}"}})
+            .as_object().unwrap().clone();
+        assert!(!verify_restored(&db, &source).unwrap());
+        assert!(verify_restored_with_scope(&db, &source, &sessions).unwrap());
+        let mut effective = source.clone();
+        prepare_import(&db, &mut effective, &sessions).unwrap();
+        assert_eq!(effective[DESCRIPTOR]["name"], "Target shared group");
+        assert!(verify_restored(&db, &effective).unwrap());
+        db.execute(
+            "UPDATE threads SET section_position=999 WHERE id=?1",
+            [id.to_string()],
+        )
+        .unwrap();
+        assert!(!verify_restored_with_scope(&db, &source, &sessions).unwrap());
+    }
 }

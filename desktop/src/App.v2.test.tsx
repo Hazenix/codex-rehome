@@ -126,6 +126,42 @@ it("shows the settings and deferred conversations while allowing the rest to be 
   expect(await screen.findByText("暂缓导入 1 条会话")).toBeVisible();
 });
 
+it("can plan copies after importing the unaffected conversations", async () => {
+  const user = userEvent.setup();
+  api.inspectPackage.mockResolvedValue({
+    ...preview,
+    manifest: { ...preview.manifest, mode: "sessions_only", projects: [], counts: { ...preview.manifest.counts, projects: 0 } },
+  });
+  const deferred = {
+    ...basePlan,
+    deferred_conversations: [{ task_id: "deferred-id", title: "Updated chat", required_source_id: null }],
+  };
+  api.buildRestorePlan.mockResolvedValueOnce(deferred).mockResolvedValueOnce({
+    ...basePlan,
+    plan_id: "copy-plan",
+    deferred_conversations: [],
+    sessions: [{ target_task_id: "copy-id", title: "Updated chat · ReHome", action: "import_as_branch" }],
+  });
+  render(<App />);
+  await user.click(screen.getByRole("button", { name: "前往导入" }));
+  await user.click(screen.getByRole("button", { name: "选择迁移包" }));
+  await user.click(await screen.findByRole("button", { name: "继续" }));
+  await user.click(screen.getByRole("button", { name: "预览导入内容" }));
+
+  const confirm = () => user.click(screen.getByRole("checkbox", { name: "确认已保存当前 Codex 工作" }));
+  await confirm();
+  await user.click(screen.getByRole("button", { name: "导入到 Codex" }));
+  await user.click(await screen.findByRole("button", { name: "预览将暂缓会话导入为副本" }));
+
+  expect(await screen.findByText("Updated chat · ReHome")).toBeVisible();
+  expect(api.buildRestorePlan).toHaveBeenLastCalledWith(preview.selection_id, "13131313-1313-4131-8131-131313131313", undefined, true);
+  expect(api.applyRestore).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("button", { name: "导入到 Codex" })).toBeDisabled();
+  await confirm();
+  await user.click(screen.getByRole("button", { name: "导入到 Codex" }));
+  expect(api.applyRestore).toHaveBeenLastCalledWith("copy-plan", expect.anything());
+});
+
 describe("V2 utility safeguards", () => {
   it.each([true, false])(
     "invalidates a preserved import result after undo settles with success=%s",

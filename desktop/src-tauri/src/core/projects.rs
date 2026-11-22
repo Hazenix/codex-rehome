@@ -48,11 +48,22 @@ pub(crate) fn descriptor(db: &Connection, id: &str) -> Result<Option<Value>, Reh
     if !has_column(db, "projects", "id")? || !has_column(db, "project_roots", "path")? {
         return Ok(None);
     }
-    let name: Option<String> = db
-        .query_row("SELECT name FROM projects WHERE id=?1", [id], |r| r.get(0))
+    let position_column = if has_column(db, "projects", "position")? {
+        "position"
+    } else {
+        "NULL"
+    };
+    let project: Option<(String, Option<i64>)> = db
+        .query_row(
+            &format!("SELECT name,{position_column} FROM projects WHERE id=?1"),
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()
         .map_err(failure)?;
-    let Some(name) = name else { return Ok(None) };
+    let Some((name, position)) = project else {
+        return Ok(None);
+    };
     let mut stmt = db
         .prepare("SELECT path FROM project_roots WHERE project_id=?1 ORDER BY position")
         .map_err(failure)?;
@@ -64,9 +75,11 @@ pub(crate) fn descriptor(db: &Connection, id: &str) -> Result<Option<Value>, Reh
     if roots.len() > 1000 || name.len() > 16 * 1024 || id.len() > 1024 {
         return Err(invalid("project metadata exceeds its inspection limit"));
     }
-    Ok(Some(
-        json!({"source_id":id,"name":name,"workspace_roots":roots}),
-    ))
+    let mut descriptor = json!({"source_id":id,"name":name,"workspace_roots":roots});
+    if let Some(position) = position {
+        descriptor["position"] = Value::from(position);
+    }
+    Ok(Some(descriptor))
 }
 
 pub(crate) fn current_threads(database: &Path) -> Result<BTreeMap<Uuid, Value>, RehomeError> {
@@ -245,6 +258,135 @@ pub(crate) fn prepare_import(
     }
     row.insert("project_id".into(), Value::String(id));
     Ok(())
+}
+
+struct ImportedProjectOrder {
+    target_id: String,
+    source_order: (i64, String),
+    target_position: Option<i64>,
+}
+
+fn imported_project_order(
+    db: &Connection,
+    rows: &[Map<String, Value>],
+) -> Result<Vec<ImportedProjectOrder>, RehomeError> {
+    if !has_column(db, "threads", "project_id")? || !has_column(db, "projects", "position")? {
+        return Ok(Vec::new());
+    }
+    let mut source_positions = BTreeMap::new();
+    let mut targets = BTreeMap::<String, (i64, String)>::new();
+    for row in rows {
+        let Some(project) = row.get(DESCRIPTOR) else {
+            continue;
+        };
+        let Some(position) = project.get("position") else {
+            continue;
+        };
+        let position = position
+            .as_i64()
+            .ok_or_else(|| invalid("logical project position must be an integer"))?;
+        let source = project
+            .get("source_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("logical project identity is missing"))?;
+        if source_positions
+            .insert(source, position)
+            .is_some_and(|previous| previous != position)
+        {
+            return Err(invalid(
+                "selected conversations disagree on their source project order",
+            ));
+        }
+        let Some(id) = expected_target_id(db, row)? else {
+            continue;
+        };
+        let order = (position, source.to_owned());
+        targets
+            .entry(id)
+            .and_modify(|existing| {
+                // Several source projects can deliberately map to one local project.
+                if order < *existing {
+                    *existing = order.clone();
+                }
+            })
+            .or_insert(order);
+    }
+    targets
+        .into_iter()
+        .map(|(target_id, source_order)| {
+            let target_position = db
+                .query_row(
+                    "SELECT position FROM projects WHERE id=?1",
+                    [&target_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(failure)?;
+            Ok(ImportedProjectOrder {
+                target_id,
+                source_order,
+                target_position,
+            })
+        })
+        .collect()
+}
+
+/// 只在本次已导入项目占用的位置之间换序，保留目标独有项目的精确位置与其他状态。
+pub(crate) fn restore_import_order(
+    db: &Connection,
+    rows: &[Map<String, Value>],
+) -> Result<(), RehomeError> {
+    let mut projects = imported_project_order(db, rows)?;
+    let mut slots = projects
+        .iter()
+        .map(|project| {
+            project
+                .target_position
+                .ok_or_else(|| failure("ordered imported project is missing from the target"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    slots.sort_unstable();
+    projects.sort_by(|left, right| left.source_order.cmp(&right.source_order));
+    if slots.windows(2).any(|pair| pair[0] == pair[1]) && !project_order_matches(&projects) {
+        return Err(failure("selected target projects have tied positions; resolve their order in Codex before importing"));
+    }
+    for (project, slot) in projects.iter().zip(slots) {
+        if project.target_position != Some(slot) {
+            db.execute(
+                "UPDATE projects SET position=?1 WHERE id=?2",
+                rusqlite::params![slot, project.target_id],
+            )
+            .map_err(failure)?;
+        }
+    }
+    Ok(())
+}
+
+fn project_order_matches(projects: &[ImportedProjectOrder]) -> bool {
+    if projects
+        .iter()
+        .any(|project| project.target_position.is_none())
+    {
+        return false;
+    }
+    let mut actual = projects.iter().collect::<Vec<_>>();
+    actual.sort_by(|left, right| {
+        (left.target_position, &left.target_id).cmp(&(right.target_position, &right.target_id))
+    });
+    actual
+        .iter()
+        .zip(projects)
+        .all(|(actual, expected)| actual.target_id == expected.target_id)
+}
+
+/// Read-only aggregate verification is needed even when all selected threads are unchanged.
+pub(crate) fn verify_import_order(
+    db: &Connection,
+    rows: &[Map<String, Value>],
+) -> Result<bool, RehomeError> {
+    let mut projects = imported_project_order(db, rows)?;
+    projects.sort_by(|left, right| left.source_order.cmp(&right.source_order));
+    Ok(project_order_matches(&projects))
 }
 
 fn matching_target_project(
@@ -584,6 +726,191 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    fn native_project(db: &Connection, id: &str, root: &str, position: i64) {
+        db.execute(
+            r#"INSERT INTO projects VALUES(?1,?1,'{"keep":"target"}',?2,41,42)"#,
+            rusqlite::params![id, position],
+        )
+        .unwrap();
+        db.execute("INSERT INTO project_roots VALUES(?1,0,?2)", [id, root])
+            .unwrap();
+    }
+
+    fn ordered_row(
+        thread: &str,
+        source: &str,
+        root: &str,
+        position: Option<i64>,
+    ) -> Map<String, Value> {
+        let mut item = row(thread, source, &[root.to_owned()]);
+        item.get_mut(DESCRIPTOR).unwrap()["bind_existing"] = Value::Bool(true);
+        if let Some(position) = position {
+            item.get_mut(DESCRIPTOR).unwrap()["position"] = Value::from(position);
+        }
+        item
+    }
+
+    fn ordered_projects(db: &Connection) -> Vec<(String, i64)> {
+        db.prepare("SELECT id,position FROM projects ORDER BY position,id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn descriptor_reads_native_sqlite_position_instead_of_project_id_or_insertion_order() {
+        let db = database();
+        native_project(&db, "first-inserted", "/target/first", 30);
+        native_project(&db, "second-inserted", "/target/second", 4);
+        assert_eq!(
+            descriptor(&db, "first-inserted").unwrap().unwrap()["position"],
+            30
+        );
+        assert_eq!(
+            descriptor(&db, "second-inserted").unwrap().unwrap()["position"],
+            4
+        );
+    }
+
+    #[test]
+    fn source_order_reuses_selected_target_slots_without_changing_other_project_state() {
+        let db = database();
+        native_project(&db, "native-first", "/target/first", 10);
+        native_project(&db, "target-only", "/target/local", 20);
+        native_project(&db, "native-second", "/target/second", 30);
+        let mut rows = vec![
+            ordered_row("early-thread-id", "source-later", "/target/first", Some(90)),
+            ordered_row(
+                "late-thread-id",
+                "source-earlier",
+                "/target/second",
+                Some(5),
+            ),
+            ordered_row(
+                "another-thread",
+                "source-earlier",
+                "/target/second",
+                Some(5),
+            ),
+        ];
+        let unchanged = |db: &Connection| {
+            db.prepare(
+                "SELECT id,name,metadata,created_at_ms,updated_at_ms FROM projects ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let before = unchanged(&db);
+        for row in &mut rows {
+            prepare_import(&db, row).unwrap();
+        }
+        assert!(!verify_import_order(&db, &rows).unwrap());
+        restore_import_order(&db, &rows).unwrap();
+        assert_eq!(
+            ordered_projects(&db),
+            vec![
+                ("native-second".into(), 10),
+                ("target-only".into(), 20),
+                ("native-first".into(), 30)
+            ]
+        );
+        assert_eq!(unchanged(&db), before);
+        assert!(verify_import_order(&db, &rows).unwrap());
+        restore_import_order(&db, &rows).unwrap();
+        assert_eq!(unchanged(&db), before);
+    }
+
+    #[test]
+    fn missing_source_position_keeps_legacy_and_mixed_project_slots_unchanged() {
+        let db = database();
+        native_project(&db, "early", "/target/early", 10);
+        native_project(&db, "legacy", "/target/legacy", 20);
+        native_project(&db, "late", "/target/late", 30);
+        let rows = vec![
+            ordered_row("one", "source-one", "/target/early", Some(7)),
+            ordered_row("two", "old-package", "/target/legacy", None),
+            ordered_row("three", "source-three", "/target/late", Some(1)),
+        ];
+        restore_import_order(&db, &rows).unwrap();
+        assert_eq!(
+            ordered_projects(&db),
+            vec![
+                ("late".into(), 10),
+                ("legacy".into(), 20),
+                ("early".into(), 30)
+            ]
+        );
+        let before = ordered_projects(&db);
+        let legacy_rows = rows
+            .into_iter()
+            .map(|mut row| {
+                row.get_mut(DESCRIPTOR)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("position");
+                row
+            })
+            .collect::<Vec<_>>();
+        restore_import_order(&db, &legacy_rows).unwrap();
+        assert_eq!(ordered_projects(&db), before);
+        assert!(verify_import_order(&db, &legacy_rows).unwrap());
+    }
+
+    #[test]
+    fn newly_created_projects_use_appended_slots_and_the_order_transaction_can_roll_back() {
+        let mut db = database();
+        native_project(&db, "local-project", "/target/local", 12);
+        {
+            let tx = db.transaction().unwrap();
+            let mut rows = vec![
+                ordered_row("one", "later", "/target/new-later", Some(10)),
+                ordered_row("two", "earlier", "/target/new-earlier", Some(3)),
+            ];
+            assert!(!verify_import_order(&tx, &rows).unwrap());
+            for row in &mut rows {
+                prepare_import(&tx, row).unwrap();
+            }
+            restore_import_order(&tx, &rows).unwrap();
+            assert_eq!(
+                ordered_projects(&tx),
+                vec![
+                    ("local-project".into(), 12),
+                    (target_id("earlier"), 13),
+                    (target_id("later"), 14)
+                ]
+            );
+            assert!(verify_import_order(&tx, &rows).unwrap());
+        }
+        assert_eq!(ordered_projects(&db), vec![("local-project".into(), 12)]);
+    }
+
+    #[test]
+    fn invalid_or_disagreeing_project_positions_are_rejected_before_reordering() {
+        let db = database();
+        native_project(&db, "native", "/target/native", 10);
+        let first = ordered_row("one", "source", "/target/native", Some(1));
+        let mut invalid = first.clone();
+        invalid.get_mut(DESCRIPTOR).unwrap()["position"] = Value::from("first");
+        assert!(restore_import_order(&db, &[invalid]).is_err());
+        let second = ordered_row("two", "source", "/target/native", Some(2));
+        assert!(restore_import_order(&db, &[first, second]).is_err());
+        assert_eq!(ordered_projects(&db), vec![("native".into(), 10)]);
     }
 
     #[test]

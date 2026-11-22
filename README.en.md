@@ -16,7 +16,8 @@ Move selected Codex Desktop projects, conversations, Skills, Plugins, and genera
 
 Choose **Conversations only** on export and select the chats to carry. The resulting `.rehome` file preserves the chats, archive status, supported attachments, pins, groups, manual order, and project membership. Map each referenced project to an existing folder on the target. ReHome remembers these folders for later imports. Review settings differences and conversation conflicts, then fully quit Codex before applying the import.
 
-- The preview defers conversations whose ID matches different local content, along with forks that require them. The original package retains the deferred conversations.
+- The preview defers conversations whose ID matches different local content, along with forks that require them. Import the other chats first, or use **Preview importing deferred chats as copies** on the preview or result screen to keep the local chats and bring in the versions from the package.
+- Projects associated with the imported chats follow their relative order from the source. Other local projects keep their positions. Shared groups with members outside the import keep the target's name and appearance.
 - The package can carry images and file attachments stored in Codex's managed directories. Paths in messages, tool output, and external file links remain references.
 - The settings comparison covers the CLI version, top-level model and provider settings in `config.toml`, enabled MCP server names, and detected skill names. Settings remain local to each computer.
 - Reopen Codex to verify that the conversations appear in the expected location and can be continued. Use synthetic conversations for rehearsals and export only authorized conversations for the actual move.

@@ -522,15 +522,18 @@ fn verify_bridge_metadata(
                     restore_failed(format!("could not verify project memberships: {e}"))
                 })?;
             let bytes = verified.authenticated_planning_payload(THREAD_METADATA_SOURCE)?;
-            for row in crate::core::bridge::package_thread_rows(
+            let rows = crate::core::bridge::package_thread_rows(
                 bytes,
                 &plan.sessions,
                 &plan.reference_rewrites,
                 &std::collections::HashMap::new(),
-            )? {
-                mapping_valid &= crate::core::projects::verify_restored(&db, &row)?;
-                mapping_valid &= crate::core::sidebar::verify_restored(&db, &row)?;
+            )?;
+            for row in &rows {
+                mapping_valid &= crate::core::projects::verify_restored(&db, row)?;
+                mapping_valid &=
+                    crate::core::sidebar::verify_restored_with_scope(&db, row, &plan.sessions)?;
             }
+            mapping_valid &= crate::core::projects::verify_import_order(&db, &rows)?;
         }
         sqlite_valid = plan.sessions.iter().all(|session| {
             sqlite_rows

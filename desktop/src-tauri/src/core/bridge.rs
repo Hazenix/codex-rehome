@@ -735,7 +735,7 @@ fn import_sqlite_threads_for_operation(
     }
     for row in &mut rows {
         crate::core::projects::prepare_import(&transaction, row)?;
-        crate::core::sidebar::prepare_import(&transaction, row)?;
+        crate::core::sidebar::prepare_import(&transaction, row, sessions)?;
         import_thread_row(&transaction, row, &schema)?;
         crate::core::attachments::import_records(&transaction, row, rewrites)?;
         crate::core::projects::verify_member(&transaction, row)?;
@@ -745,6 +745,7 @@ fn import_sqlite_threads_for_operation(
             ));
         }
     }
+    crate::core::projects::restore_import_order(&transaction, &rows)?;
     transaction.commit().map_err(|error| {
         restore_failed(format!("could not commit Codex thread import: {error}"))
     })?;
@@ -856,6 +857,9 @@ pub(crate) fn package_thread_rows(
             Value::String(session.target_task_id.to_string()),
         );
         object.insert("title".into(), Value::String(session.title.clone()));
+        if session.target_task_id != session.source_task_id && object.contains_key("name") {
+            object.insert("name".into(), Value::String(session.title.clone()));
+        }
         object.insert(
             "rollout_path".into(),
             Value::String(path_text(&session.target)?.to_owned()),

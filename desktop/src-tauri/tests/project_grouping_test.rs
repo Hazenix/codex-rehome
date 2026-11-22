@@ -102,7 +102,7 @@ fn roundtrip(modern: bool) -> Result<(), Box<dyn Error>> {
             let id = format!("logical-{i}");
             db.execute(
                 "INSERT INTO projects VALUES(?1,'同名项目','{}',?2,0,0)",
-                params![id, i],
+                params![id, 1 - i as i64],
             )?;
             db.execute(
                 "INSERT INTO project_roots VALUES(?1,0,?2)",
@@ -156,6 +156,25 @@ fn roundtrip(modern: bool) -> Result<(), Box<dyn Error>> {
     let preview = inspect_package(&path)?;
     assert_eq!(preview.manifest.projects.len(), 2);
     assert_eq!(preview.manifest.conversations.len(), 4);
+    if modern {
+        use std::io::Read;
+        let mut archive = zip::ZipArchive::new(fs::File::open(&path)?)?;
+        let mut metadata = String::new();
+        archive
+            .by_name("codex/metadata/threads.json")?
+            .read_to_string(&mut metadata)?;
+        let rows: Vec<Value> = serde_json::from_str(&metadata)?;
+        let first = rows
+            .iter()
+            .find(|row| row["id"] == ids[0].to_string())
+            .unwrap();
+        let second = rows
+            .iter()
+            .find(|row| row["id"] == ids[2].to_string())
+            .unwrap();
+        assert_eq!(first["_rehome_project"]["position"], 1);
+        assert_eq!(second["_rehome_project"]["position"], 0);
+    }
     let target_home = f.root.join("target/.codex");
     fs::create_dir_all(&target_home)?;
     let schema: String = Connection::open(&f.state_db_path)?.query_row(
@@ -203,6 +222,24 @@ fn roundtrip(modern: bool) -> Result<(), Box<dyn Error>> {
     );
     let db = Connection::open(target_home.join("state_5.sqlite"))?;
     if modern {
+        let ordered = db
+            .prepare("SELECT id FROM projects ORDER BY position,id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected = ["logical-1", "logical-0"]
+            .iter()
+            .map(|source| {
+                Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!("rehome:logical-project:{source}").as_bytes(),
+                )
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered, expected,
+            "project list must follow the source's manual order rather than thread IDs"
+        );
         assert_eq!(
             db.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get::<_, i64>(0))?,
             2

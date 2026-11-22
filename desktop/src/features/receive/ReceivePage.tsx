@@ -159,12 +159,14 @@ export default function ReceivePage({
     }
   }
 
-  async function handlePlan(resolution: FileConflictResolution | null = null) {
+  async function handlePlan(
+    resolution: FileConflictResolution | null = null,
+    copyConflictingConversations = false,
+  ) {
     if (!preview || !locations || phase !== "idle") return;
     const generation = ++requestGeneration.current;
     setError(null);
     setSupportId(null);
-    setReport(null);
     setPhase("planning");
     onOperationStart();
     try {
@@ -172,16 +174,20 @@ export default function ReceivePage({
         preview.selection_id,
         locations.selection_id,
         resolution ?? undefined,
+        copyConflictingConversations,
       );
       if (generation === requestGeneration.current) {
+        clearRestoreSelection();
         setPlan(nextPlan);
         setConflictResolution(resolution);
-        setCodexClosed(false);
         setStep("review");
       }
     } catch (caught) {
       if (generation !== requestGeneration.current) return;
-      setPlan(null);
+      if (!report && step === "review") {
+        clearRestoreSelection();
+        setStep("location");
+      }
       setSupportId(supportIdFromError(caught));
       setError(errorMessage(caught));
     } finally {
@@ -272,6 +278,9 @@ export default function ReceivePage({
     preview && preview.manifest.counts.projects > 0,
   );
   const deferredConversations = plan?.deferred_conversations ?? [];
+  const conversationCopies = preview?.manifest.mode === "sessions_only"
+    ? plan?.sessions.filter((session) => session.action === "import_as_branch") ?? []
+    : [];
   const canRestore = Boolean(
     plan &&
       plan.conflict_count === 0 &&
@@ -634,6 +643,20 @@ export default function ReceivePage({
                   </li>
                 ))}
               </ul>
+              <button
+                className="secondary-button"
+                disabled={busy}
+                onClick={() => void handlePlan(conflictResolution, true)}
+              >
+                {t("预览将暂缓会话导入为副本")}
+              </button>
+            </details>
+          )}
+          {conversationCopies.length > 0 && (
+            <details className="technical-details" open>
+              <summary>{t("将 {count} 条会话导入为副本", { count: conversationCopies.length })}</summary>
+              <p className="muted">{t("本机已有会话会保留。关联的分叉会使用迁入的原对话。")}</p>
+              <ul>{conversationCopies.map((chat) => <li key={chat.target_task_id}>{chat.title}</li>)}</ul>
             </details>
           )}
           {plan.conflict_count > 0 ? (
@@ -641,7 +664,7 @@ export default function ReceivePage({
               count={plan.conflict_count}
               resolution={conflictResolution}
               busy={busy}
-              onResolve={handlePlan}
+              onResolve={(resolution) => handlePlan(resolution, conversationCopies.length > 0)}
             />
           ) : (
             <>
@@ -720,9 +743,16 @@ export default function ReceivePage({
             </strong>
           </div>
           {deferredConversations.length > 0 && (
-            <p className="manual-status">
-              {t("暂缓导入 {count} 条会话", { count: deferredConversations.length })}
-            </p>
+            <div className="manual-status">
+              <p>{t("暂缓导入 {count} 条会话", { count: deferredConversations.length })}</p>
+              <button
+                className="secondary-button"
+                disabled={busy}
+                onClick={() => void handlePlan(conflictResolution, true)}
+              >
+                {t("预览将暂缓会话导入为副本")}
+              </button>
+            </div>
           )}
           <p className="manual-status">
             {t(

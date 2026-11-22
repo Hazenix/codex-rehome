@@ -81,6 +81,8 @@ pub enum BuildRestorePlanRequest {
         package_selection_id: Uuid,
         destination_selection_id: Uuid,
         conflict_resolution: Option<FileConflictResolution>,
+        #[serde(default)]
+        copy_conflicting_conversations: bool,
     },
 }
 
@@ -683,6 +685,7 @@ pub async fn build_restore_plan(
                 package_selection_id,
                 destination_selection_id,
                 conflict_resolution,
+                copy_conflicting_conversations,
             } => {
                 let package_path = state.resolve_package(package_selection_id)?;
                 let (projects_root, backup_root) = state
@@ -711,7 +714,8 @@ pub async fn build_restore_plan(
                 let options = RestorePlanningOptions {
                     project_destinations,
                     defer_conflicting_conversations: package.manifest.mode
-                        == PackageMode::SessionsOnly,
+                        == PackageMode::SessionsOnly
+                        && !copy_conflicting_conversations,
                 };
                 let target = TargetInventory {
                     codex_home: inventory.codex_home,

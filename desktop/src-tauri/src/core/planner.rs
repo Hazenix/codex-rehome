@@ -6,7 +6,7 @@ use crate::core::{
         PlannedOperation, PlannedSession, ProjectEntry, ReferenceRewrite, ReferenceRewriteKind,
         RestorePlan, SessionAction, SourceOs, TargetInventory,
     },
-    package::{inspect_package_for_planning, VerifiedPayload},
+    package::{inspect_package_for_planning, VerifiedPackage, VerifiedPayload},
     paths::normalize_entry,
     session::{parse_session_metadata, session_history_mode},
     session_stream::SessionPayload,
@@ -342,8 +342,7 @@ pub fn build_restore_plan_with_options(
             });
         }
         let mut base_rewrites = conversation_rewrites(
-            payloads,
-            &verified.planning_payloads,
+            &verified,
             conversation,
             &package.manifest.projects,
             &project_targets,
@@ -406,8 +405,7 @@ pub fn build_restore_plan_with_options(
                 conversation,
                 source_bytes,
                 &original_target,
-                payloads,
-                &verified.planning_payloads,
+                &verified,
                 &package.manifest.projects,
                 &project_targets,
                 &target_conversations,
@@ -490,15 +488,6 @@ pub fn build_restore_plan_with_options(
             operations.push(classify_bridge_change(HISTORY_SOURCE, path, state));
         }
         let planned_rewrites = rewrites.values().cloned().collect::<Vec<_>>();
-        let desired_thread_rollout_paths = sessions
-            .iter()
-            .map(|session| {
-                Ok((
-                    session.target_task_id.to_string(),
-                    target_path_text(&session.target)?.to_owned(),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, RehomeError>>()?;
         let all_sessions_skipped = sessions
             .iter()
             .all(|session| session.action == SessionAction::Skip);
@@ -535,20 +524,19 @@ pub fn build_restore_plan_with_options(
                 .ok_or_else(|| package_invalid("verified thread metadata bytes are missing"))?;
             let history_modes = sessions
                 .iter()
-                .filter_map(|session| {
-                    verified
+                .map(|session| {
+                    let mode = verified
                         .planning_payloads
                         .get(&session.package_source)
-                        .and_then(|bytes| session_history_mode(bytes))
-                        .map(|mode| (session.target_task_id.to_string(), mode.to_owned()))
+                        .and_then(|bytes| session_history_mode(bytes));
+                    (session.source_task_id, mode)
                 })
-                .collect::<BTreeMap<_, _>>();
+                .collect::<HashMap<_, _>>();
             if let Some(operation) = plan_thread_metadata_merge(
-                THREAD_METADATA_SOURCE,
                 target_path,
                 bytes,
                 &planned_rewrites,
-                &desired_thread_rollout_paths,
+                &sessions,
                 &history_modes,
                 all_sessions_skipped && !payloads.contains_key(crate::core::attachments::SOURCE),
                 target.target_os,
@@ -896,33 +884,30 @@ fn plan_index_merge(
     Ok(Some(classify_bridge_change(source, target, state)))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn plan_thread_metadata_merge(
-    source: &str,
     target: PathBuf,
     bytes: &[u8],
     rewrites: &[ReferenceRewrite],
-    desired_rollout_paths: &BTreeMap<String, String>,
-    history_modes: &BTreeMap<String, String>,
+    sessions: &[PlannedSession],
+    history_modes: &HashMap<Uuid, Option<&'static str>>,
     all_sessions_skipped: bool,
     target_os: SourceOs,
 ) -> Result<Option<PlannedOperation>, RehomeError> {
     let state = target_state(&target, target_os)?;
     if let TargetState::File(hash) = &state {
-        let desired = rewrite_metadata_document(
-            bytes,
-            rewrites,
-            source,
-            desired_rollout_paths,
-            history_modes,
-        )?;
-        let metadata_ready = sqlite_threads_contain(&target, &desired)?;
+        let desired =
+            crate::core::bridge::package_thread_rows(bytes, sessions, rewrites, history_modes)?;
+        let metadata_ready = sqlite_threads_contain(&target, &desired, sessions)?;
         ensure_target_hash(&target, hash)?;
         if all_sessions_skipped && metadata_ready {
             return Ok(None);
         }
     }
-    Ok(Some(classify_bridge_change(source, target, state)))
+    Ok(Some(classify_bridge_change(
+        THREAD_METADATA_SOURCE,
+        target,
+        state,
+    )))
 }
 
 fn classify_bridge_change(source: &str, target: PathBuf, state: TargetState) -> PlannedOperation {
@@ -1099,8 +1084,7 @@ fn plan_branch_session(
     conversation: &crate::core::models::ConversationEntry,
     source_bytes: &SessionPayload,
     original_target: &Path,
-    payloads: &BTreeMap<String, VerifiedPayload>,
-    planning_payloads: &BTreeMap<String, Vec<u8>>,
+    verified: &VerifiedPackage,
     projects: &[crate::core::models::ProjectEntry],
     project_targets: &HashMap<Uuid, PathBuf>,
     target_conversations: &HashMap<Uuid, &crate::core::models::ConversationEntry>,
@@ -1119,8 +1103,7 @@ fn plan_branch_session(
         if let Some(existing) = target_conversations.get(&candidate) {
             let existing_target = codex_target_path(codex_home, &existing.archive_path, target_os)?;
             let mut candidate_rewrites = conversation_rewrites(
-                payloads,
-                planning_payloads,
+                verified,
                 conversation,
                 projects,
                 project_targets,
@@ -1153,8 +1136,7 @@ fn plan_branch_session(
 
         let candidate_target = branch_session_target(original_target, candidate, target_os)?;
         let mut candidate_rewrites = conversation_rewrites(
-            payloads,
-            planning_payloads,
+            verified,
             conversation,
             projects,
             project_targets,
@@ -1212,8 +1194,7 @@ fn derive_branch_id(package_id: Uuid, source_task_id: Uuid, attempt: u32) -> Uui
 }
 
 fn conversation_rewrites(
-    payloads: &BTreeMap<String, VerifiedPayload>,
-    planning_payloads: &BTreeMap<String, Vec<u8>>,
+    verified: &VerifiedPackage,
     conversation: &crate::core::models::ConversationEntry,
     projects: &[crate::core::models::ProjectEntry],
     project_targets: &HashMap<Uuid, PathBuf>,
@@ -1221,6 +1202,8 @@ fn conversation_rewrites(
     target_session: &Path,
     target_codex_home: &Path,
 ) -> Result<Vec<ReferenceRewrite>, RehomeError> {
+    let payloads = &verified.payloads;
+    let planning_payloads = &verified.planning_payloads;
     let mut rewrites = BTreeMap::new();
     if let Some((target_task_id, target_title)) = branch {
         add_branch_rewrites(
@@ -1630,67 +1613,6 @@ fn workspace_relative_parts(path: &str, base: &str) -> Option<Vec<String>> {
     Some(path[base.len()..].to_vec())
 }
 
-fn rewrite_metadata_document(
-    bytes: &[u8],
-    rewrites: &[ReferenceRewrite],
-    source: &str,
-    desired_rollout_paths: &BTreeMap<String, String>,
-    history_modes: &BTreeMap<String, String>,
-) -> Result<serde_json::Value, RehomeError> {
-    let selected = rewrites
-        .iter()
-        .filter(|rewrite| rewrite.package_source == source)
-        .collect::<Vec<_>>();
-    let mut value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|error| package_invalid(format!("bridge metadata JSON is invalid: {error}")))?;
-    match &mut value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                rewrite_scoped_metadata_row(value, &selected);
-                set_desired_rollout_path(value, desired_rollout_paths);
-                set_desired_history_mode(value, history_modes);
-            }
-        }
-        serde_json::Value::Object(_) => {
-            rewrite_scoped_metadata_row(&mut value, &selected);
-            set_desired_rollout_path(&mut value, desired_rollout_paths);
-            set_desired_history_mode(&mut value, history_modes);
-        }
-        _ => return Err(package_invalid("bridge metadata JSON has an invalid shape")),
-    }
-    Ok(value)
-}
-
-fn set_desired_history_mode(
-    value: &mut serde_json::Value,
-    history_modes: &BTreeMap<String, String>,
-) {
-    let desired = metadata_id(value)
-        .and_then(|id| history_modes.get(id))
-        .cloned();
-    if let (Some(object), Some(desired)) = (value.as_object_mut(), desired) {
-        object.insert(
-            "history_mode".to_owned(),
-            serde_json::Value::String(desired),
-        );
-    }
-}
-
-fn set_desired_rollout_path(
-    value: &mut serde_json::Value,
-    desired_rollout_paths: &BTreeMap<String, String>,
-) {
-    let desired = metadata_id(value)
-        .and_then(|id| desired_rollout_paths.get(id))
-        .cloned();
-    if let (Some(object), Some(desired)) = (value.as_object_mut(), desired) {
-        object.insert(
-            "rollout_path".to_owned(),
-            serde_json::Value::String(desired),
-        );
-    }
-}
-
 fn read_hashed_target(path: &Path, expected_hash: &str) -> Result<Vec<u8>, RehomeError> {
     let bytes = fs::read(path).map_err(|error| {
         restore_failed(format!(
@@ -1790,11 +1712,9 @@ fn metadata_id(value: &serde_json::Value) -> Option<&str> {
 
 fn sqlite_threads_contain(
     database: &Path,
-    desired: &serde_json::Value,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    sessions: &[PlannedSession],
 ) -> Result<bool, RehomeError> {
-    let rows = desired
-        .as_array()
-        .ok_or_else(|| package_invalid("thread metadata must be a JSON array"))?;
     let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| {
             restore_failed(format!(
@@ -1808,10 +1728,7 @@ fn sqlite_threads_contain(
     }
 
     for desired_row in rows {
-        let mut object = desired_row
-            .as_object()
-            .ok_or_else(|| package_invalid("thread metadata row must be a JSON object"))?
-            .clone();
+        let mut object = desired_row.clone();
         if let Some(id) = crate::core::projects::expected_target_id(&connection, &object)? {
             object.insert("project_id".into(), serde_json::Value::String(id));
             if !crate::core::projects::verify_restored(&connection, &object)? {
@@ -1820,10 +1737,12 @@ fn sqlite_threads_contain(
         } else {
             object.remove("project_id");
         }
-        if !crate::core::sidebar::verify_restored(&connection, &object)? {
+        if !crate::core::sidebar::verify_restored_with_scope(&connection, &object, sessions)? {
             return Ok(false);
         }
-        let id = metadata_id(desired_row)
+        let id = desired_row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
             .ok_or_else(|| package_invalid("thread metadata row is missing its conversation ID"))?;
         if object.contains_key("rollout_path") && !columns.contains("rollout_path") {
             return Ok(false);
@@ -1870,7 +1789,7 @@ fn sqlite_threads_contain(
             }
         }
     }
-    Ok(true)
+    crate::core::projects::verify_import_order(&connection, rows)
 }
 
 fn sqlite_thread_columns(connection: &Connection) -> Result<HashSet<String>, RehomeError> {

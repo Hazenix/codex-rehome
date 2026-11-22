@@ -188,7 +188,11 @@ export interface RestorePlan {
   target_codex_home: string;
   projects_root: string;
   operations: PlannedOperation[];
-  sessions: unknown[];
+  sessions: {
+    target_task_id: string;
+    title: string;
+    action: "skip" | "import" | "import_as_branch";
+  }[];
   deferred_conversations?: DeferredConversation[];
   configuration_differences?: ConfigurationDifference[] | null;
   reference_rewrites: unknown[];

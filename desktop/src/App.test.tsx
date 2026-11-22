@@ -437,6 +437,7 @@ describe("ReHome Desktop workflows", () => {
       conversationOnlyPreview.selection_id,
       automaticLocations.selection_id,
       undefined,
+      false,
     );
     await user.click(screen.getByText("查看文件变更"));
     expect(await screen.findByText("codex/session_index.jsonl")).toBeVisible();
@@ -739,6 +740,7 @@ describe("ReHome Desktop workflows", () => {
       preview.selection_id,
       "13131313-1313-4131-8131-131313131313",
       "keep_existing",
+      false,
     );
     expect(
       await screen.findByText("已选择保留新电脑上的不同文件。"),
