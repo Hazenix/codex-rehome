@@ -1,5 +1,6 @@
 use crate::core::{
     error::{ErrorCode, RehomeError},
+    history_export::HISTORY_SOURCE,
     models::{
         BridgeVerificationRequirements, ChangeKind, FileConflictResolution, PackagePreview,
         PlannedOperation, PlannedSession, ProjectEntry, ReferenceRewrite, ReferenceRewriteKind,
@@ -58,6 +59,12 @@ type SessionDecision = (
 
 type RewriteMap = BTreeMap<(Uuid, String, ReferenceRewriteKind, String, String), ReferenceRewrite>;
 
+#[derive(Debug, Default)]
+pub struct RestorePlanningOptions {
+    pub project_destinations: HashMap<Uuid, PathBuf>,
+    pub defer_conflicting_conversations: bool,
+}
+
 pub fn build_restore_plan(
     package: &PackagePreview,
     target: &TargetInventory,
@@ -71,6 +78,22 @@ pub fn build_restore_plan_with_conflict_resolution(
     target: &TargetInventory,
     projects_root: &Path,
     conflict_resolution: Option<FileConflictResolution>,
+) -> Result<RestorePlan, RehomeError> {
+    build_restore_plan_with_options(
+        package,
+        target,
+        projects_root,
+        conflict_resolution,
+        &RestorePlanningOptions::default(),
+    )
+}
+
+pub fn build_restore_plan_with_options(
+    package: &PackagePreview,
+    target: &TargetInventory,
+    projects_root: &Path,
+    conflict_resolution: Option<FileConflictResolution>,
+    options: &RestorePlanningOptions,
 ) -> Result<RestorePlan, RehomeError> {
     validate_plan_inputs(package, target, projects_root)?;
     validate_root_ancestry(&target.codex_home, target.target_os)?;
@@ -101,17 +124,40 @@ pub fn build_restore_plan_with_conflict_resolution(
 
     let mut operations = Vec::new();
     let mut sessions = Vec::new();
+    let mut deferred_conversations = Vec::new();
+    let mut deferred_ids = HashSet::new();
     let mut rewrites = BTreeMap::new();
     let mut consumed = HashSet::new();
     let mut project_targets = HashMap::new();
     let directory_names = project_directory_names(&package.manifest.projects, target.target_os);
 
     for project in &package.manifest.projects {
-        let target_root = join_target(
-            projects_root,
-            &directory_names[&project.project_id],
-            target.target_os,
-        )?;
+        let target_root = if package.manifest.mode == crate::core::models::PackageMode::SessionsOnly
+        {
+            let path = options
+                .project_destinations
+                .get(&project.project_id)
+                .ok_or_else(|| {
+                    restore_failed(format!(
+                        "select an existing destination directory for project {}",
+                        project.name
+                    ))
+                })?;
+            if !is_target_absolute(path, target.target_os)? || !path.is_dir() {
+                return Err(restore_failed(
+                    "session-only project destination must be an existing absolute directory",
+                ));
+            }
+            validate_root_ancestry(path, target.target_os)?;
+            validate_root_separation(&target.codex_home, path, target.target_os)?;
+            path.clone()
+        } else {
+            join_target(
+                projects_root,
+                &directory_names[&project.project_id],
+                target.target_os,
+            )?
+        };
         project_targets.insert(project.project_id, target_root.clone());
         let prefix = format!("{}/", project.archive_path);
         for (source, payload) in payloads
@@ -199,6 +245,16 @@ pub fn build_restore_plan_with_conflict_resolution(
 
     for id in order {
         let conversation = by_id[&id];
+        if let Some(parent) = lineage[&id].filter(|parent| deferred_ids.contains(parent)) {
+            deferred_ids.insert(id);
+            deferred_conversations.push(super::models::DeferredConversation {
+                task_id: id,
+                title: conversation.title.clone(),
+                required_source_id: Some(parent),
+            });
+            consumed.insert(conversation.archive_path.clone());
+            continue;
+        }
         let payload = payloads.get(&conversation.archive_path).ok_or_else(|| {
             package_invalid("manifest conversation references a missing package payload")
         })?;
@@ -293,11 +349,28 @@ pub fn build_restore_plan_with_conflict_resolution(
             &project_targets,
             None,
             &existing_target,
+            &target.codex_home,
         )?;
         base_rewrites.extend(lineage_rewrites.iter().cloned());
         let base_hash =
             rewritten_content_hash(source_bytes, &base_rewrites, &conversation.archive_path)?;
         let existing_state = target_state(&existing_target, target.target_os)?;
+        if options.defer_conflicting_conversations
+            && match &existing_state {
+                TargetState::Missing => false,
+                TargetState::File(hash) => !hash.eq_ignore_ascii_case(&base_hash),
+                TargetState::Other => true,
+            }
+        {
+            deferred_ids.insert(id);
+            deferred_conversations.push(super::models::DeferredConversation {
+                task_id: id,
+                title: conversation.title.clone(),
+                required_source_id: None,
+            });
+            consumed.insert(conversation.archive_path.clone());
+            continue;
+        }
         let (
             action,
             target_task_id,
@@ -383,13 +456,39 @@ pub fn build_restore_plan_with_conflict_resolution(
         consumed.insert(conversation.archive_path.clone());
     }
 
-    for source in [SESSION_INDEX_SOURCE, THREAD_METADATA_SOURCE] {
+    for source in [SESSION_INDEX_SOURCE, THREAD_METADATA_SOURCE, HISTORY_SOURCE] {
         if payloads.contains_key(source) {
             consumed.insert(source.to_owned());
         }
     }
     let mut bridge_verification = BridgeVerificationRequirements::default();
     if !sessions.is_empty() {
+        let has_paginated_sessions = sessions.iter().any(|session| {
+            verified
+                .planning_payloads
+                .get(&session.package_source)
+                .and_then(|bytes| session_history_mode(bytes))
+                == Some("paginated")
+        });
+        if has_paginated_sessions
+            && package.manifest.mode == crate::core::models::PackageMode::SessionsOnly
+        {
+            if !payloads.contains_key(HISTORY_SOURCE) {
+                return Err(package_invalid("session-only package is missing the paginated history index. Export the conversations again with the current version of ReHome"));
+            }
+            let path = join_target(
+                &target.codex_home,
+                crate::core::bridge::HISTORY_DATABASE,
+                target.target_os,
+            )?;
+            let state = target_state(&path, target.target_os)?;
+            if !matches!(state, TargetState::File(_)) {
+                return Err(restore_failed("target Codex paginated history database is missing or inaccessible. Open Codex locally, create a test conversation, then quit Codex before importing"));
+            }
+            crate::core::bridge::validate_restore_target(&target.codex_home, &path)?;
+            crate::core::history_import::validate_database(&path)?;
+            operations.push(classify_bridge_change(HISTORY_SOURCE, path, state));
+        }
         let planned_rewrites = rewrites.values().cloned().collect::<Vec<_>>();
         let desired_thread_rollout_paths = sessions
             .iter()
@@ -451,7 +550,7 @@ pub fn build_restore_plan_with_conflict_resolution(
                 &planned_rewrites,
                 &desired_thread_rollout_paths,
                 &history_modes,
-                all_sessions_skipped,
+                all_sessions_skipped && !payloads.contains_key(crate::core::attachments::SOURCE),
                 target.target_os,
             )? {
                 operations.push(operation);
@@ -459,8 +558,56 @@ pub fn build_restore_plan_with_conflict_resolution(
         }
     }
 
+    let attachment_files = if let Some(bytes) = verified
+        .planning_payloads
+        .get(crate::core::attachments::SOURCE)
+    {
+        let attachment_manifest = crate::core::attachments::parse(bytes)?;
+        let declared = package
+            .manifest
+            .conversations
+            .iter()
+            .map(|conversation| conversation.task_id)
+            .collect::<HashSet<_>>();
+        if attachment_manifest
+            .files
+            .iter()
+            .any(|file| !declared.contains(&file.thread_id))
+        {
+            return Err(package_invalid(
+                "attachment references a conversation absent from the package",
+            ));
+        }
+        let declared_files = attachment_manifest
+            .files
+            .iter()
+            .map(|file| file.archive_path.as_str())
+            .collect::<HashSet<_>>();
+        if payloads.keys().any(|source| {
+            source.starts_with("codex/attachments/") && !declared_files.contains(source.as_str())
+        }) {
+            return Err(package_invalid(
+                "package contains an unassociated attachment payload",
+            ));
+        }
+        crate::core::attachments::planned_files(bytes, &sessions, payloads)?
+    } else {
+        if payloads
+            .keys()
+            .any(|source| source.starts_with("codex/attachments/"))
+        {
+            return Err(package_invalid(
+                "attachment payload has no selected-conversation metadata",
+            ));
+        }
+        BTreeSet::new()
+    };
     for (source, payload) in payloads {
-        if consumed.contains(source) || is_package_only_metadata(source) {
+        if consumed.contains(source)
+            || is_package_only_metadata(source)
+            || source == crate::core::attachments::SOURCE
+            || (source.starts_with("codex/attachments/") && !attachment_files.contains(source))
+        {
             continue;
         }
         let target_path = codex_target_path(&target.codex_home, source, target.target_os)?;
@@ -473,7 +620,11 @@ pub fn build_restore_plan_with_conflict_resolution(
                 target_path,
                 payload,
                 target.target_os,
-                conflict_resolution,
+                if source.starts_with("codex/attachments/") {
+                    None
+                } else {
+                    conflict_resolution
+                },
             )?,
         };
         operations.push(operation);
@@ -511,6 +662,7 @@ pub fn build_restore_plan_with_conflict_resolution(
         projects_root: projects_root.to_path_buf(),
         operations,
         sessions,
+        deferred_conversations,
         reference_rewrites,
         bridge_verification,
         conflict_count,
@@ -974,6 +1126,7 @@ fn plan_branch_session(
                 project_targets,
                 Some((candidate, &title)),
                 &existing_target,
+                codex_home,
             )?;
             candidate_rewrites.extend_from_slice(lineage_rewrites);
             let expected_hash = rewritten_content_hash(
@@ -1007,6 +1160,7 @@ fn plan_branch_session(
             project_targets,
             Some((candidate, &title)),
             &candidate_target,
+            codex_home,
         )?;
         candidate_rewrites.extend_from_slice(lineage_rewrites);
         let expected_hash = rewritten_content_hash(
@@ -1065,6 +1219,7 @@ fn conversation_rewrites(
     project_targets: &HashMap<Uuid, PathBuf>,
     branch: Option<(Uuid, &str)>,
     target_session: &Path,
+    target_codex_home: &Path,
 ) -> Result<Vec<ReferenceRewrite>, RehomeError> {
     let mut rewrites = BTreeMap::new();
     if let Some((target_task_id, target_title)) = branch {
@@ -1090,6 +1245,18 @@ fn conversation_rewrites(
         conversation.task_id,
         target_session,
     )?;
+    if let Some(bytes) = planning_payloads.get(crate::core::attachments::SOURCE) {
+        for rewrite in crate::core::attachments::rewrites(bytes, conversation, target_codex_home)? {
+            insert_rewrite(
+                &mut rewrites,
+                rewrite.source_task_id,
+                rewrite.package_source,
+                rewrite.kind,
+                rewrite.from,
+                rewrite.to,
+            );
+        }
+    }
     Ok(rewrites.into_values().collect())
 }
 
@@ -1151,6 +1318,7 @@ fn rewrite_scoped_metadata_row(value: &mut serde_json::Value, rewrites: &[&Refer
 }
 
 fn rewrite_json_value(value: &mut serde_json::Value, rewrites: &[&ReferenceRewrite]) {
+    crate::core::attachments::rewrite_record(value, rewrites);
     let Some(object) = value.as_object_mut() else {
         return;
     };
@@ -1292,7 +1460,9 @@ fn rewrite_known_metadata_fields(
         if let Some(rewrite) = rewrites.iter().find(|rewrite| {
             text == rewrite.from
                 && match rewrite.kind {
-                    ReferenceRewriteKind::LineageId | ReferenceRewriteKind::LineageOffset => false,
+                    ReferenceRewriteKind::LineageId
+                    | ReferenceRewriteKind::LineageOffset
+                    | ReferenceRewriteKind::AttachmentPath => false,
                     ReferenceRewriteKind::ConversationId => {
                         include_identity
                             && matches!(
@@ -1642,18 +1812,16 @@ fn sqlite_threads_contain(
             .as_object()
             .ok_or_else(|| package_invalid("thread metadata row must be a JSON object"))?
             .clone();
-        if let Some(source) = object
-            .get(crate::core::projects::DESCRIPTOR)
-            .and_then(|d| d.get("source_id"))
-            .and_then(serde_json::Value::as_str)
-        {
-            let id = crate::core::projects::target_id(source);
+        if let Some(id) = crate::core::projects::expected_target_id(&connection, &object)? {
             object.insert("project_id".into(), serde_json::Value::String(id));
             if !crate::core::projects::verify_restored(&connection, &object)? {
                 return Ok(false);
             }
         } else {
             object.remove("project_id");
+        }
+        if !crate::core::sidebar::verify_restored(&connection, &object)? {
+            return Ok(false);
         }
         let id = metadata_id(desired_row)
             .ok_or_else(|| package_invalid("thread metadata row is missing its conversation ID"))?;

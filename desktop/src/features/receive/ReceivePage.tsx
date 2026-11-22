@@ -116,6 +116,10 @@ export default function ReceivePage({
           );
           if (generation !== requestGeneration.current) return;
           setLocations(selected);
+        } else if (inspected.manifest.mode === "sessions_only") {
+          const selected = await selectRestoreDestinations(inspected.selection_id, true);
+          if (generation !== requestGeneration.current) return;
+          setLocations(selected);
         } else {
           setLocations(null);
         }
@@ -214,8 +218,7 @@ export default function ReceivePage({
   }, [rollbackResult, report?.transaction_id]);
 
   async function handleRestore() {
-    if (!plan || plan.conflict_count > 0 || !codexClosed || phase !== "idle")
-      return;
+    if (!plan || !canRestore) return;
     setError(null);
     setSupportId(null);
     setPhase("restoring");
@@ -223,7 +226,7 @@ export default function ReceivePage({
     try {
       const restored = await applyRestore(plan.plan_id, {
         codex_closed_confirmed: true,
-        register_projects: true,
+        register_projects: preview?.manifest.mode !== "sessions_only",
       });
       setReport(restored);
       setStep("result");
@@ -268,9 +271,11 @@ export default function ReceivePage({
   const projectLocationRequired = Boolean(
     preview && preview.manifest.counts.projects > 0,
   );
+  const deferredConversations = plan?.deferred_conversations ?? [];
   const canRestore = Boolean(
     plan &&
       plan.conflict_count === 0 &&
+      (deferredConversations.length === 0 || plan.operations.length > 0) &&
       codexClosed &&
       phase === "idle" &&
       !report,
@@ -467,23 +472,29 @@ export default function ReceivePage({
           />
           <PathPicker
             icon={FolderOpen}
-            label={t("项目保存位置")}
+            label={t(preview?.manifest.mode === "sessions_only" ? "关联已有项目目录" : "项目保存位置")}
             value={
               projectLocationRequired
-                ? (locations?.projects_root ?? t("尚未选择"))
+                ? (preview?.manifest.mode === "sessions_only" ? t("逐个选择本机已有的项目文件夹") : (locations?.projects_root ?? t("尚未选择")))
                 : t("迁移包不含项目文件，无需选择")
             }
             buttonLabel={
-              projectLocationRequired ? t("选择项目保存位置") : undefined
+              projectLocationRequired ? t(preview?.manifest.mode === "sessions_only" ? "选择已有项目目录" : "选择项目保存位置") : undefined
             }
             onClick={projectLocationRequired ? chooseLocations : undefined}
             disabled={busy}
           />
             {projectLocationRequired && (
-              <p className="muted">{t(
-                "选择项目的上级文件夹，ReHome 会在其中为各项目建立目录，并更新关联对话的项目路径。导入前请在预览中检查完整目标路径。",
-              )}</p>
+              <p className="muted">{t(preview?.manifest.mode === "sessions_only"
+                ? "项目文件不会写入所选目录；只更新会话中的项目路径与归属。"
+                : "选择项目的上级文件夹，ReHome 会在其中为各项目建立目录，并更新关联对话的项目路径。导入前请在预览中检查完整目标路径。")}</p>
             )}
+            {preview?.manifest.mode === "sessions_only" && preview.manifest.projects.map((project) => (
+              <div className="summary-row" key={project.project_id}>
+                <span>{project.name}<small><code>{project.source_path}</code></small></span>
+                <code>{locations?.project_destinations?.[project.project_id] ?? t("尚未选择")}</code>
+              </div>
+            ))}
             <p className="privacy-note">{t("安全备份由 ReHome 自动管理")}</p>
           <footer className="action-footer">
             <span className="muted">{t("预览不会写入迁移内容。")}</span>
@@ -525,8 +536,12 @@ export default function ReceivePage({
             <span>{t("Codex 数据位置")}</span>
             <code>{plan.target_codex_home}</code>
           </div>
-          {projectLocationRequired && (
-            <div className="summary-row">
+          {projectLocationRequired && (preview?.manifest.mode === "sessions_only" ? preview.manifest.projects.map((project) => (
+            <div className="summary-row" key={project.project_id}>
+              <span>{project.name}</span>
+              <code>{locations?.project_destinations?.[project.project_id] ?? t("尚未选择")}</code>
+            </div>
+          )) : <div className="summary-row">
               <span>{t("目标项目目录")}</span>
               <code>{plan.projects_root}</code>
             </div>
@@ -569,6 +584,58 @@ export default function ReceivePage({
               </table>
             </div>
           </details>
+          {plan.configuration_differences != null && (
+            <details className="technical-details" open={plan.configuration_differences.length > 0}>
+              <summary>{t("配置差异")}</summary>
+              {plan.configuration_differences.length === 0 ? (
+                <p className="muted">{t("未发现可对比的配置差异。")}</p>
+              ) : (
+                <div className="table-wrap">
+                  <table className="conflict-table">
+                    <thead>
+                      <tr>
+                        <th>{t("设置")}</th>
+                        <th>{t("旧电脑")}</th>
+                        <th>{t("本机")}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {plan.configuration_differences.map(({ setting, source, target }) => (
+                        <tr key={setting}>
+                          <th scope="row">{t({
+                            codex_version: "Codex CLI 版本",
+                            model: "模型",
+                            model_provider: "模型服务提供方",
+                            mcp_servers: "已启用 MCP",
+                            skills: "Skills",
+                          }[setting])}</th>
+                          <td>{source === null ? t("未检测") : source || "—"}</td>
+                          <td>{target === null ? t("未检测") : target || "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </details>
+          )}
+          {deferredConversations.length > 0 && (
+            <details className="technical-details" open>
+              <summary>{t("暂缓导入 {count} 条会话", { count: deferredConversations.length })}</summary>
+              <p className="muted">{t("其余会话可以继续导入。暂缓的会话仍保存在原迁移包中。")}</p>
+              <ul>
+                {deferredConversations.map((chat) => (
+                  <li key={chat.task_id}>
+                    <strong>{chat.title}</strong>
+                    {" — "}
+                    {t(chat.required_source_id ? "依赖的原对话已暂缓" : "本机同一会话内容不同")}
+                    {" "}
+                    <code>{chat.task_id}</code>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
           {plan.conflict_count > 0 ? (
             <ConflictResolutionPanel
               count={plan.conflict_count}
@@ -598,7 +665,7 @@ export default function ReceivePage({
                 <span>
                   <strong>{t("当前 Codex 工作已保存")}</strong>
                   <small>
-                    {t("导入完成后请退出并重新打开 Codex，以加载迁移内容。")}
+                    {t("请保存工作并完全退出 Codex 后再导入。")}
                   </small>
                 </span>
               </label>
@@ -652,6 +719,11 @@ export default function ReceivePage({
               {t(useConfirmed ? "已由你确认能用" : "实际使用待确认")}
             </strong>
           </div>
+          {deferredConversations.length > 0 && (
+            <p className="manual-status">
+              {t("暂缓导入 {count} 条会话", { count: deferredConversations.length })}
+            </p>
+          )}
           <p className="manual-status">
             {t(
               "文件和索引已导入。请重启 Codex，打开原对话并继续发送一条消息，确认可以使用。",

@@ -60,6 +60,20 @@ const THREAD_EXPORT_COLUMNS_V1: &[&str] = &[
     "has_user_event",
     "preview",
     "history_mode",
+    "name",
+    "is_pinned",
+    "thread_section_id",
+    "section_position",
+    "section_entered_at_ms",
+    "archived_at",
+    "creator_user_id",
+    "creator_account_id",
+    "thread_source",
+    "originator",
+    "created_at_ms",
+    "updated_at_ms",
+    "recency_at",
+    "recency_at_ms",
 ];
 const EXCLUSION_RULES: &[&str] = &[
     "credentials and authentication data",
@@ -70,7 +84,7 @@ const EXCLUSION_RULES: &[&str] = &[
 ];
 
 pub fn create_package(request: CreatePackageRequest) -> Result<CreatePackageReport, RehomeError> {
-    create_package_with_overwrite(request, false)
+    create_package_with_overwrite(request, false, None)
 }
 
 /// Creates a package after the desktop save dialog has explicitly confirmed replacement.
@@ -78,12 +92,28 @@ pub fn create_package(request: CreatePackageRequest) -> Result<CreatePackageRepo
 pub fn create_package_replacing(
     request: CreatePackageRequest,
 ) -> Result<CreatePackageReport, RehomeError> {
-    create_package_with_overwrite(request, true)
+    create_package_with_overwrite(request, true, None)
+}
+
+/// Export workspace identities without reading or carrying any workspace files.
+pub fn create_package_with_project_references(
+    request: CreatePackageRequest,
+    references: &[ProjectEntry],
+) -> Result<CreatePackageReport, RehomeError> {
+    create_package_with_overwrite(request, false, Some(references))
+}
+
+pub fn create_package_with_project_references_replacing(
+    request: CreatePackageRequest,
+    references: &[ProjectEntry],
+) -> Result<CreatePackageReport, RehomeError> {
+    create_package_with_overwrite(request, true, Some(references))
 }
 
 fn create_package_with_overwrite(
     request: CreatePackageRequest,
     replace_existing: bool,
+    project_references: Option<&[ProjectEntry]>,
 ) -> Result<CreatePackageReport, RehomeError> {
     validate_output_path(&request.output_path, replace_existing)?;
     let inventory = discover_codex(Some(request.codex_home.clone()))?;
@@ -134,12 +164,28 @@ fn create_package_with_overwrite(
         let mut excluded_files = 0_u64;
         let mut excluded_bytes = 0_u64;
 
-        let (projects, project_exclusions) = stage_projects(
-            &request.project_paths,
-            staging.path(),
-            &mut payloads,
-            &mut counts,
-        )?;
+        let (projects, project_exclusions) = if let Some(references) = project_references {
+            if !request.project_paths.is_empty()
+                || !request.skill_paths.is_empty()
+                || !request.plugin_paths.is_empty()
+                || !request.generated_image_paths.is_empty()
+            {
+                return Err(package_invalid(
+                    "session-only packages cannot contain project file selections",
+                ));
+            }
+            (
+                stage_project_references(references, staging.path(), &mut payloads, &mut counts)?,
+                (0, 0),
+            )
+        } else {
+            stage_projects(
+                &request.project_paths,
+                staging.path(),
+                &mut payloads,
+                &mut counts,
+            )?
+        };
         excluded_files += project_exclusions.0;
         excluded_bytes += project_exclusions.1;
 
@@ -147,11 +193,31 @@ fn create_package_with_overwrite(
             inventory.session_index_path.as_deref(),
             &request.conversation_ids,
         )?;
-        let thread_export = inventory
+        let mut thread_export = inventory
             .state_db_path
             .as_deref()
             .map(|state_db| export_selected_threads(state_db, &request.conversation_ids))
             .transpose()?;
+        if project_references.is_some() {
+            if let Some(export) = thread_export.as_mut() {
+                for row in export.by_id.values_mut() {
+                    if let Some(project) = row
+                        .get_mut(crate::core::projects::DESCRIPTOR)
+                        .and_then(Value::as_object_mut)
+                    {
+                        project.insert("bind_existing".into(), Value::Bool(true));
+                    }
+                }
+                export.bytes = serde_json::to_vec(&export.by_id.values().collect::<Vec<_>>())
+                    .map_err(|error| {
+                        package_invalid(format!("could not encode project bindings: {error}"))
+                    })?;
+                ensure_planning_payload_size(
+                    "codex/metadata/threads.json",
+                    export.bytes.len() as u64,
+                )?;
+            }
+        }
         let conversations = stage_conversations(
             ConversationSelection {
                 paths: &selected_paths,
@@ -166,6 +232,39 @@ fn create_package_with_overwrite(
             &mut payloads,
             &mut counts,
         )?;
+
+        let attachments = if project_references.is_some() {
+            crate::core::attachments::collect(
+                &request.codex_home,
+                inventory.state_db_path.as_deref(),
+                &conversations,
+                staging.path(),
+            )?
+        } else {
+            crate::core::attachments::AttachmentManifest::default()
+        };
+        if !attachments.files.is_empty() {
+            for file in &attachments.files {
+                if !payloads.entries.contains_key(&file.archive_path) {
+                    payloads.insert(
+                        file.archive_path.clone(),
+                        Payload {
+                            hash: file.content_hash.clone(),
+                            executable: false,
+                        },
+                    )?;
+                }
+            }
+            let bytes = serde_json::to_vec(&attachments)
+                .map_err(|error| package_invalid(error.to_string()))?;
+            ensure_planning_payload_size(crate::core::attachments::SOURCE, bytes.len() as u64)?;
+            stage_generated(
+                staging.path(),
+                &mut payloads,
+                crate::core::attachments::SOURCE,
+                &bytes,
+            )?;
+        }
 
         let graph = conversations
             .iter()
@@ -238,10 +337,28 @@ fn create_package_with_overwrite(
                     staging.path(),
                     &mut payloads,
                     "codex/metadata/threads.json",
-                    &thread_export.bytes,
+                    &crate::core::attachments::decorate_threads(
+                        &thread_export.bytes,
+                        &attachments,
+                    )?,
                 )?;
             }
             counts.sqlite_threads = thread_export.count;
+        }
+        if project_references.is_some() {
+            if let Some(hash) = crate::core::history_export::stage(
+                &request.codex_home,
+                staging.path(),
+                &conversations,
+            )? {
+                payloads.insert(
+                    crate::core::history_export::HISTORY_SOURCE.to_owned(),
+                    Payload {
+                        hash,
+                        executable: false,
+                    },
+                )?;
+            }
         }
 
         if !request.skill_paths.is_empty() {
@@ -281,8 +398,15 @@ fn create_package_with_overwrite(
             source_os: inventory.source_os,
             source_arch: env::consts::ARCH.to_owned(),
             source_device_id: request.source_device_id,
-            mode: PackageMode::Full,
+            mode: if project_references.is_some() {
+                PackageMode::SessionsOnly
+            } else {
+                PackageMode::Full
+            },
             parent_checkpoint: None,
+            source_configuration: project_references
+                .is_some()
+                .then(|| crate::core::configuration::ConfigurationSummary::read(&inventory)),
             counts: counts.clone(),
             projects,
             conversations,
@@ -561,7 +685,11 @@ pub(crate) fn inspect_package_for_planning(path: &Path) -> Result<VerifiedPackag
         .iter()
         .map(|conversation| conversation.archive_path.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    for source in ["codex/session_index.jsonl", "codex/metadata/threads.json"] {
+    for source in [
+        "codex/session_index.jsonl",
+        "codex/metadata/threads.json",
+        crate::core::attachments::SOURCE,
+    ] {
         if payloads.contains_key(source) {
             planning_sources.insert(source.to_owned());
         }
@@ -745,6 +873,38 @@ fn complete_session_index(
         ensure_control_size("codex/session_index.jsonl", bytes.len() as u64)?;
     }
     Ok(bytes)
+}
+
+fn stage_project_references(
+    references: &[ProjectEntry],
+    staging_root: &Path,
+    payloads: &mut PayloadCollection,
+    counts: &mut ContentCounts,
+) -> Result<Vec<ProjectEntry>, RehomeError> {
+    let mut projects = Vec::new();
+    let mut ids = HashSet::new();
+    for reference in references {
+        if !ids.insert(reference.project_id) {
+            return Err(package_invalid("project reference is duplicated"));
+        }
+        let mut project = reference.clone();
+        project.archive_path = format!("projects/{}/files", project.project_id);
+        project.file_count = 0;
+        project.content_bytes = 0;
+        let bytes = serde_json::to_vec_pretty(&project).map_err(|error| {
+            package_invalid(format!("could not serialize project reference: {error}"))
+        })?;
+        stage_generated(
+            staging_root,
+            payloads,
+            &format!("projects/{}/project.json", project.project_id),
+            &bytes,
+        )?;
+        projects.push(project);
+    }
+    projects.sort_by_key(|project| project.project_id);
+    counts.projects += projects.len() as u64;
+    Ok(projects)
 }
 
 fn stage_projects(
@@ -932,6 +1092,12 @@ fn stage_conversations(
             .current_threads
             .and_then(|rows| rows.get(&task_id))
         {
+            if let Some(name) = current
+                .get("name")
+                .filter(|value| value.as_str().is_some_and(|name| !name.trim().is_empty()))
+            {
+                metadata["name"] = name.clone();
+            }
             if let Some(cwd) = current
                 .get("cwd")
                 .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
@@ -943,7 +1109,7 @@ fn stage_conversations(
         conversations.push(ConversationEntry {
             task_id,
             project_id: associated_project_id(metadata, &session_value, selection.projects),
-            title: metadata_string(metadata, &["title", "thread_name"])
+            title: metadata_string(metadata, &["name", "title", "thread_name"])
                 .or_else(|| metadata_string(&session_value, &["title", "thread_name"]))
                 .unwrap_or_else(|| "Imported conversation".to_owned()),
             updated_at: metadata_string(metadata, &["updated_at", "timestamp"])
@@ -1112,6 +1278,10 @@ fn export_selected_threads(
             if let Some(project) = crate::core::projects::descriptor(&connection, id)? {
                 object.insert(crate::core::projects::DESCRIPTOR.to_owned(), project);
             }
+        }
+        if let Some(section_id) = object.get("thread_section_id").and_then(Value::as_str) {
+            let section = crate::core::sidebar::descriptor(&connection, section_id)?;
+            object.insert(crate::core::sidebar::DESCRIPTOR.to_owned(), section);
         }
         if let Some(rollout_path) = object
             .get("rollout_path")
@@ -1764,6 +1934,49 @@ fn validate_manifest_archive_paths(
         }
     }
 
+    if manifest.mode == PackageMode::SessionsOnly {
+        let mut allowed = HashSet::from([
+            "manifest.json".to_owned(),
+            "checksums.sha256".to_owned(),
+            "codex/session_index.jsonl".to_owned(),
+            "codex/metadata/threads.json".to_owned(),
+            "codex/metadata/attachments.json".to_owned(),
+            crate::core::history_export::HISTORY_SOURCE.to_owned(),
+        ]);
+        let includes_non_session_content = manifest.counts.project_files != 0
+            || manifest.counts.skills != 0
+            || manifest.counts.plugins != 0
+            || manifest.counts.generated_images != 0
+            || manifest
+                .projects
+                .iter()
+                .any(|project| project.file_count != 0 || project.content_bytes != 0);
+        if includes_non_session_content {
+            return Err(package_invalid(
+                "session-only package declares content besides conversations",
+            ));
+        }
+        allowed.extend(
+            manifest
+                .conversations
+                .iter()
+                .map(|chat| chat.archive_path.clone()),
+        );
+        allowed.extend(
+            manifest
+                .projects
+                .iter()
+                .map(|project| format!("projects/{}/project.json", project.project_id)),
+        );
+        if let Some(path) = file_paths
+            .iter()
+            .find(|path| !allowed.contains(*path) && !path.starts_with("codex/attachments/rehome/"))
+        {
+            return Err(package_invalid(format!(
+                "session-only package contains an unexpected payload: {path}"
+            )));
+        }
+    }
     for project in &manifest.projects {
         let expected_root = format!("projects/{}/files", project.project_id);
         let path = validate_manifest_archive_path(&project.archive_path)?;
@@ -1984,7 +2197,10 @@ fn ensure_control_size(name: &str, size: u64) -> Result<(), RehomeError> {
 fn control_file_limit(name: &str) -> u64 {
     if matches!(
         name,
-        "checksums.sha256" | "codex/session_index.jsonl" | "codex/metadata/threads.json"
+        "checksums.sha256"
+            | "codex/session_index.jsonl"
+            | "codex/metadata/threads.json"
+            | "codex/metadata/attachments.json"
     ) {
         MAX_CHECKSUM_FILE_BYTES
     } else {
@@ -2021,7 +2237,9 @@ fn ensure_archive_entry_size(name: &str, size: u64) -> Result<(), RehomeError> {
     }
     if matches!(
         name,
-        "codex/metadata/threads.json" | "codex/session_index.jsonl"
+        "codex/metadata/threads.json"
+            | "codex/session_index.jsonl"
+            | "codex/metadata/attachments.json"
     ) {
         return ensure_planning_payload_size(name, size);
     }
@@ -2835,3 +3053,7 @@ fn zip_package_error(error: zip::result::ZipError) -> RehomeError {
         error => package_invalid(format!("ZIP write failed: {error}")),
     }
 }
+
+#[cfg(test)]
+#[path = "sidebar_export_tests.rs"]
+mod sidebar_export_tests;

@@ -14,6 +14,13 @@ type Translator = (key: string, variables?: Variables) => string;
 const STORAGE_KEY = "rehome.locale";
 
 const english: Record<string, string> = {
+  "只迁移会话": "Conversations only",
+  "保留项目归属；在目标电脑选择已有项目目录，不复制项目文件、Skills 或插件。": "Keep project associations and select existing project folders on the destination. Project files, Skills, and plugins are not copied.",
+  "只迁移会话与项目归属，项目文件不会进入迁移包。": "Only conversations and project associations are included. Project files stay out of the package.",
+  "关联已有项目目录": "Link existing project folders",
+  "逐个选择本机已有的项目文件夹": "Choose an existing local folder for each project",
+  "选择已有项目目录": "Select existing project folders",
+  "项目文件不会写入所选目录；只更新会话中的项目路径与归属。": "No project files are written to these folders. Only conversation project paths and associations are updated.",
   "如果 Codex 首次打开分叉对话时历史为空，请先打开它的原对话一次，再返回分叉对话。请保留迁移包和备份，直到历史确认完整。": "If a fork initially shows no history in Codex, open its source chat once, then return to the fork. Keep the package and backups until you have confirmed the history is complete.",
   "分叉对话": "Forked chat",
   "需要一起迁移的原对话": "Source chats needed for this migration",
@@ -438,6 +445,19 @@ const english: Record<string, string> = {
   确认导入内容: "Review import",
   "需要 {size}": "Requires {size}",
   "冲突 {count}": "Conflicts {count}",
+  "配置差异": "Configuration differences",
+  "请保存工作并完全退出 Codex 后再导入。": "Save your work and fully quit Codex before importing.",
+  "未发现可对比的配置差异。": "No differences in the settings that could be compared.",
+  "旧电脑": "Source computer",
+  "本机": "This computer",
+  "Codex CLI 版本": "Codex CLI version",
+  "模型": "Model",
+  "模型服务提供方": "Model provider",
+  "已启用 MCP": "Enabled MCP servers",
+  "暂缓导入 {count} 条会话": "{count} conversations deferred",
+  "其余会话可以继续导入。暂缓的会话仍保存在原迁移包中。": "You can import the remaining conversations. Deferred conversations are still in the original package.",
+  "依赖的原对话已暂缓": "Required parent conversation is deferred",
+  "本机同一会话内容不同": "This computer has different content for the same conversation",
   "发现 {count} 个同名但内容不同的文件。":
     "Same-name files with different content: {count}.",
   "仍有 {count} 个无法自动处理的结构冲突。":

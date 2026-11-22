@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   CodexInventory,
+  ConfigurationDifference,
   CreatePackageReport,
   CreatePackageRequest,
   FileConflictResolution,
@@ -46,13 +47,18 @@ export function inspectPackage(): Promise<PackagePreview | null> {
 
 export async function selectRestoreDestinations(
   packageSelectionId: string,
+  reuseSavedMappings = false,
 ): Promise<RestoreLocationSelection | null> {
   const response = await invoke<
     | ({ action: "destinations" } & RestoreLocationSelection)
     | { action: "plan"; plan: RestorePlan }
     | null
   >("build_restore_plan", {
-    request: { action: "select_destinations", package_selection_id: packageSelectionId },
+    request: {
+      action: "select_destinations",
+      package_selection_id: packageSelectionId,
+      ...(reuseSavedMappings ? { reuse_saved_mappings: true } : {}),
+    },
   });
   return response?.action === "destinations" ? response : null;
 }
@@ -62,7 +68,11 @@ export async function buildRestorePlan(
   destinationSelectionId: string,
   conflictResolution?: FileConflictResolution,
 ): Promise<RestorePlan> {
-  const response = await invoke<{ action: "plan"; plan: RestorePlan } | null>(
+  const response = await invoke<{
+    action: "plan";
+    plan: RestorePlan;
+    configuration_differences?: ConfigurationDifference[] | null;
+  } | null>(
     "build_restore_plan",
     {
       request: {
@@ -74,7 +84,7 @@ export async function buildRestorePlan(
     },
   );
   if (response?.action !== "plan") throw new Error("恢复位置选择已取消");
-  return response.plan;
+  return { ...response.plan, configuration_differences: response.configuration_differences };
 }
 
 export function applyRestore(planId: string, options: RestoreOptions): Promise<RestoreReport> {

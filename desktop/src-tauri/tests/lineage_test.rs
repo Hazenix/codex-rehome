@@ -26,7 +26,7 @@ fn nested_round_trip(legacy_provenance: bool) -> Result<(), Box<dyn Error>> {
         discovery::discover_codex,
         models::*,
         package::inspect_package,
-        planner::build_restore_plan,
+        planner::{build_restore_plan, build_restore_plan_with_options, RestorePlanningOptions},
         restore::{apply_restore, rollback},
     };
     let f = synthetic_codex_fixture()?;
@@ -158,6 +158,32 @@ fn nested_round_trip(legacy_provenance: bool) -> Result<(), Box<dyn Error>> {
         conversations: vec![parent_entry.clone()],
     };
     let projects = f.root.join("much-longer-mapped-project-destination");
+    let partial_plan = build_restore_plan_with_options(
+        &preview,
+        &target,
+        &projects,
+        None,
+        &RestorePlanningOptions {
+            defer_conflicting_conversations: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(partial_plan.sessions.is_empty());
+    assert_eq!(
+        partial_plan
+            .deferred_conversations
+            .iter()
+            .map(|chat| (
+                chat.task_id.to_string(),
+                chat.required_source_id.map(|id| id.to_string())
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (THREAD_ID.to_owned(), None),
+            (CHILD.to_owned(), Some(THREAD_ID.to_owned())),
+            (GRANDCHILD.to_owned(), Some(CHILD.to_owned()))
+        ]
+    );
     let plan = build_restore_plan(&preview, &target, &projects)?;
     let parent_session = plan
         .sessions

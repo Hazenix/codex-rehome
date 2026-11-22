@@ -113,6 +113,7 @@ export interface CodexInventory {
 }
 
 export interface CreatePackageRequest {
+  include_project_files?: boolean;
   project_ids: string[];
   conversation_ids: string[];
   skill_ids: string[];
@@ -137,7 +138,7 @@ export interface PackageManifest {
   source_os: SourceOs;
   source_arch: string;
   source_device_id: string;
-  mode: "full";
+  mode: "full" | "sessions_only";
   parent_checkpoint: string | null;
   counts: ContentCounts;
   projects: ProjectEntry[];
@@ -167,6 +168,18 @@ export interface PlannedOperation {
   rollback_required: boolean;
 }
 
+export interface ConfigurationDifference {
+  setting: "codex_version" | "model" | "model_provider" | "mcp_servers" | "skills";
+  source: string | null;
+  target: string | null;
+}
+
+export interface DeferredConversation {
+  task_id: string;
+  title: string;
+  required_source_id: string | null;
+}
+
 export interface RestorePlan {
   plan_id: string;
   package_path: string;
@@ -176,6 +189,8 @@ export interface RestorePlan {
   projects_root: string;
   operations: PlannedOperation[];
   sessions: unknown[];
+  deferred_conversations?: DeferredConversation[];
+  configuration_differences?: ConfigurationDifference[] | null;
   reference_rewrites: unknown[];
   bridge_verification: {
     session_index: string | null;
@@ -191,6 +206,7 @@ export interface RestoreOptions {
 }
 
 export interface RestoreLocationSelection {
+  project_destinations?: Record<string, string>;
   selection_id: string;
   target_codex_home: string;
   projects_root: string;

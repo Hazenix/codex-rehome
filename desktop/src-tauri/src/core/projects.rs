@@ -77,28 +77,34 @@ pub(crate) fn current_threads(database: &Path) -> Result<BTreeMap<Uuid, Value>, 
     )
     .map_err(failure)?;
     let modern = has_column(&db, "threads", "project_id")?;
-    let sql = if modern {
-        "SELECT id,cwd,project_id FROM threads"
+    let project_column = if modern { "project_id" } else { "NULL" };
+    let name_column = if has_column(&db, "threads", "name")? {
+        "name"
     } else {
-        "SELECT id,cwd,NULL FROM threads"
+        "NULL"
     };
-    let mut stmt = db.prepare(sql).map_err(failure)?;
+    let sql = format!("SELECT id,cwd,{project_column},{name_column} FROM threads");
+    let mut stmt = db.prepare(&sql).map_err(failure)?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })
         .map_err(failure)?;
     let mut result = BTreeMap::new();
     for row in rows {
-        let (id, cwd, project) = row.map_err(failure)?;
+        let (id, cwd, project, name) = row.map_err(failure)?;
         let Ok(id) = Uuid::parse_str(&id) else {
             continue;
         };
         let mut value = json!({"cwd":cwd});
+        if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+            value["name"] = Value::String(name);
+        }
         if let Some(project) = project {
             if let Some(d) = descriptor(&db, &project)? {
                 value[DESCRIPTOR] = d
@@ -153,7 +159,12 @@ pub(crate) fn prepare_import(
                 .ok_or_else(|| invalid("logical project root is not a valid target path"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let id = target_id(source);
+    let reused = if d.get("bind_existing").and_then(Value::as_bool) == Some(true) {
+        matching_target_project(db, &roots)?
+    } else {
+        None
+    };
+    let id = reused.clone().unwrap_or_else(|| target_id(source));
     let thread = row
         .get("id")
         .and_then(Value::as_str)
@@ -168,6 +179,10 @@ pub(crate) fn prepare_import(
         .map_err(failure)?;
     if existing.flatten().is_some_and(|old| old != id) {
         return Err(failure("existing conversation belongs to a different target project; its assignment was preserved"));
+    }
+    if reused.is_some() {
+        row.insert("project_id".into(), Value::String(id));
+        return Ok(());
     }
     let exists: bool = db
         .query_row(
@@ -232,6 +247,74 @@ pub(crate) fn prepare_import(
     Ok(())
 }
 
+fn matching_target_project(
+    db: &Connection,
+    roots: &[String],
+) -> Result<Option<String>, RehomeError> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = db.prepare("SELECT id FROM projects").map_err(failure)?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(failure)?;
+    let mut matches = Vec::new();
+    for id in ids {
+        let id = id.map_err(failure)?;
+        let saved = descriptor(db, &id)?
+            .ok_or_else(|| failure("target project disappeared during matching"))?;
+        let saved_roots = saved["workspace_roots"]
+            .as_array()
+            .ok_or_else(|| failure("invalid target project roots"))?;
+        if roots.iter().all(|root| {
+            saved_roots
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|saved| Path::new(root) == Path::new(saved))
+        }) {
+            matches.push(id);
+        }
+    }
+    if matches.len() > 1 {
+        return Err(failure("multiple local projects use the selected directories; resolve the ambiguous project roots in Codex before importing"));
+    }
+    Ok(matches.pop())
+}
+
+pub(crate) fn expected_target_id(
+    db: &Connection,
+    row: &Map<String, Value>,
+) -> Result<Option<String>, RehomeError> {
+    if !has_column(db, "threads", "project_id")? {
+        return Ok(None);
+    }
+    let Some(project) = row.get(DESCRIPTOR) else {
+        return Ok(None);
+    };
+    let source = project
+        .get("source_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("missing source project"))?;
+    let roots = project
+        .get("workspace_roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("invalid project roots"))?;
+    let roots = roots
+        .iter()
+        .map(|root| {
+            root.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("invalid project root"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if project.get("bind_existing").and_then(Value::as_bool) == Some(true) {
+        return Ok(Some(
+            matching_target_project(db, &roots)?.unwrap_or_else(|| target_id(source)),
+        ));
+    }
+    Ok(Some(target_id(source)))
+}
+
 pub(crate) fn verify_member(db: &Connection, row: &Map<String, Value>) -> Result<(), RehomeError> {
     let Some(expected) = row.get("project_id").and_then(Value::as_str) else {
         return Ok(());
@@ -268,7 +351,23 @@ pub(crate) fn verify_restored(
         .get("source_id")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("missing source project"))?;
-    let expected = target_id(source);
+    let roots = d
+        .get("workspace_roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("invalid project roots"))?;
+    let owned_roots = roots
+        .iter()
+        .map(|root| {
+            root.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("invalid project root"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = if d.get("bind_existing").and_then(Value::as_bool) == Some(true) {
+        matching_target_project(db, &owned_roots)?.unwrap_or_else(|| target_id(source))
+    } else {
+        target_id(source)
+    };
     let id = row
         .get("id")
         .and_then(Value::as_str)
@@ -443,6 +542,47 @@ mod tests {
             db.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn mapped_reference_reuses_one_native_project_and_rejects_ambiguous_roots() {
+        let db = database();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        db.execute(
+            "INSERT INTO projects VALUES('native','User name','{}',0,0,0)",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO project_roots VALUES('native',0,?1)", [&path])
+            .unwrap();
+        let mut item = row("thread", "source-project", std::slice::from_ref(&path));
+        item.get_mut(DESCRIPTOR).unwrap()["bind_existing"] = Value::Bool(true);
+        prepare_import(&db, &mut item).unwrap();
+        assert_eq!(item["project_id"], "native");
+        db.execute("INSERT INTO threads VALUES('thread','native')", [])
+            .unwrap();
+        assert!(verify_restored(&db, &item).unwrap());
+        db.execute(
+            "INSERT INTO projects VALUES('duplicate','Other name','{}',1,0,0)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO project_roots VALUES('duplicate',0,?1)",
+            [&path],
+        )
+        .unwrap();
+        assert!(prepare_import(&db, &mut item)
+            .unwrap_err()
+            .message
+            .contains("multiple local projects"));
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
         );
     }
 

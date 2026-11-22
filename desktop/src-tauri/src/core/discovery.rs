@@ -430,6 +430,12 @@ fn discovered_conversations(
         let task_id = session.task_id;
         let mut metadata = index.get(&task_id).unwrap_or(&session.fields).clone();
         if let Some(current) = current_threads.get(&task_id) {
+            if let Some(name) = current
+                .get("name")
+                .filter(|value| value.as_str().is_some_and(|name| !name.trim().is_empty()))
+            {
+                metadata["name"] = name.clone();
+            }
             if let Some(cwd) = current
                 .get("cwd")
                 .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
@@ -452,7 +458,7 @@ fn discovered_conversations(
             }
         };
         let classification = conversation_classification(&session.fields);
-        let indexed_title = metadata_string(metadata, &["title", "thread_name"])
+        let indexed_title = metadata_string(metadata, &["name", "title", "thread_name"])
             .or_else(|| metadata_string(&session.fields, &["title", "thread_name"]));
         let title = indexed_title
             .filter(|title| title != "Codex conversation")

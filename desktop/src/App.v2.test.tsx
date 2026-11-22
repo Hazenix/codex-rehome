@@ -103,6 +103,29 @@ async function plannedImport(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole("button", { name: "选择项目保存位置" }));
   await user.click(screen.getByRole("button", { name: "预览导入内容" }));
 }
+it("shows the settings and deferred conversations while allowing the rest to be imported", async () => {
+  const user = userEvent.setup();
+  api.buildRestorePlan.mockResolvedValue({
+    ...basePlan,
+    configuration_differences: [{ setting: "model_provider", source: "custom-provider", target: "openai" }],
+    deferred_conversations: [{ task_id: "deferred-id", title: "Conflicting sample", required_source_id: null }],
+  });
+  render(<App />);
+  await plannedImport(user);
+
+  expect(await screen.findByText("配置差异")).toBeVisible();
+  expect(screen.getByText("custom-provider")).toBeVisible();
+  expect(screen.getByText("openai")).toBeVisible();
+  expect(screen.getByText("Conflicting sample")).toBeVisible();
+  const importButton = screen.getByRole("button", { name: "导入到 Codex" });
+  expect(importButton).toBeDisabled();
+  await user.click(screen.getByRole("checkbox", { name: "确认已保存当前 Codex 工作" }));
+  expect(importButton).toBeEnabled();
+  await user.click(importButton);
+  expect(api.applyRestore).toHaveBeenCalledOnce();
+  expect(await screen.findByText("暂缓导入 1 条会话")).toBeVisible();
+});
+
 describe("V2 utility safeguards", () => {
   it.each([true, false])(
     "invalidates a preserved import result after undo settles with success=%s",

@@ -5,15 +5,15 @@ use crate::core::{
     error::{ErrorCode, RehomeError},
     models::{
         CodexInventory, ContentCounts, CreatePackageReport, CreatePackageRequest,
-        FileConflictResolution, PackagePreview, RecoveryStatus, RegistrationStatus, RestoreOptions,
-        RestorePlan, RestoreReport, RollbackReport, SourceOs, TargetInventory, TransactionHistory,
-        TransactionSummary,
+        FileConflictResolution, PackageMode, PackagePreview, ProjectEntry, RecoveryStatus,
+        RegistrationStatus, RestoreOptions, RestorePlan, RestoreReport, RollbackReport, SourceOs,
+        TargetInventory, TransactionHistory, TransactionSummary,
     },
     package::{
         create_package_replacing as core_create_package_replacing,
-        inspect_package as core_inspect_package,
+        create_package_with_project_references_replacing, inspect_package as core_inspect_package,
     },
-    planner::build_restore_plan_with_conflict_resolution as core_build_restore_plan,
+    planner::{build_restore_plan_with_options as core_build_restore_plan, RestorePlanningOptions},
     restore::{
         apply_restore_by_id_observed, list_transaction_history as core_list_transaction_history,
         rollback as core_rollback, transaction_summary as core_transaction_summary,
@@ -21,6 +21,7 @@ use crate::core::{
 };
 use crate::support::{self, models::*, SupportService};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -40,11 +41,17 @@ const GRANT_TTL: Duration = Duration::from_secs(15 * 60);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePackageSelection {
+    #[serde(default = "include_project_files_by_default")]
+    pub include_project_files: bool,
     pub project_ids: Vec<Uuid>,
     pub conversation_ids: Vec<Uuid>,
     pub skill_ids: Vec<Uuid>,
     pub plugin_ids: Vec<Uuid>,
     pub generated_image_ids: Vec<Uuid>,
+}
+
+fn include_project_files_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +74,8 @@ pub struct InspectedPackage {
 pub enum BuildRestorePlanRequest {
     SelectDestinations {
         package_selection_id: Uuid,
+        #[serde(default)]
+        reuse_saved_mappings: bool,
     },
     Build {
         package_selection_id: Uuid,
@@ -83,9 +92,11 @@ pub enum BuildRestorePlanResponse {
         target_codex_home: PathBuf,
         projects_root: PathBuf,
         backup_root: PathBuf,
+        project_destinations: HashMap<Uuid, PathBuf>,
     },
     Plan {
         plan: RestorePlan,
+        configuration_differences: Option<Vec<crate::core::configuration::ConfigurationDifference>>,
     },
 }
 
@@ -149,6 +160,7 @@ struct RestoreLocationGrant {
     package_selection_id: Uuid,
     projects_root: PathBuf,
     backup_root: PathBuf,
+    project_destinations: HashMap<Uuid, PathBuf>,
 }
 
 #[derive(Clone)]
@@ -301,6 +313,7 @@ impl WorkflowState {
                 package_selection_id,
                 projects_root,
                 backup_root,
+                project_destinations: HashMap::new(),
             }),
         );
         id
@@ -464,6 +477,9 @@ pub async fn create_package(
 ) -> Result<Option<CreatedPackage>, SupportFailure> {
     let state = state.inner().clone();
     run_supported(Stage::Export, state.support.clone(), move |snapshot| {
+        if !selection.include_project_files {
+            ensure_codex_desktop_is_closed()?;
+        }
         let Some(selected) = app
             .dialog()
             .file()
@@ -480,9 +496,18 @@ pub async fn create_package(
         let inventory = core_discover_codex(None)?;
         snapshot.codex_home = Some(inventory.codex_home.clone());
         snapshot.source_os = Some(inventory.source_os);
+        let references = if !selection.include_project_files {
+            Some(selected_project_references(&inventory, &selection)?)
+        } else {
+            None
+        };
         let request = resolve_create_package_request(&inventory, selection, output_path)?;
         // The native save dialog only returns an existing filename after the user confirms replace.
-        let report = core_create_package_replacing(request)?;
+        let report = if let Some(references) = references {
+            create_package_with_project_references_replacing(request, &references)?
+        } else {
+            core_create_package_replacing(request)?
+        };
         let preview = core_inspect_package(&report.package_path)?;
         let canonical = canonical_existing_file(&report.package_path)?;
         let reveal_id = state.grant_inspected_package(canonical, preview.archive_hash.clone())?;
@@ -546,6 +571,7 @@ pub async fn build_restore_plan(
         move |snapshot| match request {
             BuildRestorePlanRequest::SelectDestinations {
                 package_selection_id,
+                reuse_saved_mappings,
             } => {
                 snapshot.stage = Stage::Destinations;
                 let package_path = state.resolve_package(package_selection_id)?;
@@ -554,7 +580,71 @@ pub async fn build_restore_plan(
                 state.validate_package_grant(package_selection_id, &package.archive_hash)?;
                 let inventory = core_discover_codex(None)?;
                 snapshot.codex_home = Some(inventory.codex_home.clone());
-                let projects_root = if package.manifest.projects.is_empty() {
+                let session_only = package.manifest.mode == PackageMode::SessionsOnly;
+                let mut project_destinations = HashMap::new();
+                if session_only {
+                    let mapping_file = crate::core::backup::app_data_root_path()?
+                        .join("session-project-mappings.json");
+                    let mut saved: HashMap<String, PathBuf> = fs::read(&mapping_file)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .unwrap_or_default();
+                    for project in &package.manifest.projects {
+                        let key = project_mapping_key(&package, project, &inventory.codex_home)?;
+                        let previous = saved
+                            .get(&key)
+                            .and_then(|path| canonical_existing_directory(path).ok())
+                            .filter(|path| saved.get(&key) == Some(path));
+                        let destination =
+                            if reuse_saved_mappings {
+                                let Some(path) = previous else {
+                                    return Ok(None);
+                                };
+                                path
+                            } else {
+                                let mut dialog = app.dialog().file().set_parent(&window).set_title(
+                                    format!("为「{}」选择本机已有的项目目录", project.name),
+                                );
+                                if let Some(path) = previous {
+                                    dialog = dialog.set_directory(path);
+                                }
+                                let Some(selected) = dialog.blocking_pick_folder() else {
+                                    return Ok(None);
+                                };
+                                let path = canonical_existing_directory(&selected_path(selected)?)?;
+                                saved.insert(key, path.clone());
+                                path
+                            };
+                        project_destinations.insert(project.project_id, destination);
+                    }
+                    if !reuse_saved_mappings && !project_destinations.is_empty() {
+                        let backup_root = managed_backup_root()?;
+                        for destination in project_destinations.values() {
+                            validate_restore_location_separation(destination, &backup_root)?;
+                        }
+                        // Remember the user's folder picker choices locally for future packages.
+                        let bytes = serde_json::to_vec(&saved).map_err(|error| {
+                            RehomeError::new(ErrorCode::RestoreFailed, error.to_string())
+                        })?;
+                        let parent = crate::core::stable_fs::PinnedParent::open(
+                            backup_root
+                                .parent()
+                                .expect("managed backup root has a parent"),
+                        )
+                        .map_err(|error| {
+                            RehomeError::new(ErrorCode::RestoreFailed, error.to_string())
+                        })?;
+                        parent
+                            .replace_bytes(
+                                std::ffi::OsStr::new("session-project-mappings.json"),
+                                &bytes,
+                            )
+                            .map_err(|error| {
+                                RehomeError::new(ErrorCode::RestoreFailed, error.to_string())
+                            })?;
+                    }
+                }
+                let projects_root = if session_only || package.manifest.projects.is_empty() {
                     default_unused_projects_root(&inventory.codex_home)?
                 } else {
                     let Some(projects) = app
@@ -570,16 +660,23 @@ pub async fn build_restore_plan(
                 };
                 let backup_root = managed_backup_root()?;
                 validate_restore_location_separation(&projects_root, &backup_root)?;
+                for destination in project_destinations.values() {
+                    validate_restore_location_separation(destination, &backup_root)?;
+                }
                 let selection_id = state.grant_restore_locations(
                     package_selection_id,
                     projects_root.clone(),
                     backup_root.clone(),
                 );
+                if let Some(grant) = state.grants().restore_locations.get_mut(&selection_id) {
+                    grant.value.project_destinations = project_destinations.clone();
+                }
                 Ok(Some(BuildRestorePlanResponse::Destinations {
                     selection_id,
                     target_codex_home: inventory.codex_home,
                     projects_root,
                     backup_root,
+                    project_destinations,
                 }))
             }
             BuildRestorePlanRequest::Build {
@@ -595,6 +692,27 @@ pub async fn build_restore_plan(
                 state.validate_package_grant(package_selection_id, &package.archive_hash)?;
                 let inventory = core_discover_codex(None)?;
                 snapshot.codex_home = Some(inventory.codex_home.clone());
+                let configuration_differences =
+                    package
+                        .manifest
+                        .source_configuration
+                        .as_ref()
+                        .map(|source| {
+                            source.differences_from(
+                                &crate::core::configuration::ConfigurationSummary::read(&inventory),
+                            )
+                        });
+                let project_destinations = state
+                    .grants()
+                    .restore_locations
+                    .get(&destination_selection_id)
+                    .map(|grant| grant.value.project_destinations.clone())
+                    .unwrap_or_default();
+                let options = RestorePlanningOptions {
+                    project_destinations,
+                    defer_conflicting_conversations: package.manifest.mode
+                        == PackageMode::SessionsOnly,
+                };
                 let target = TargetInventory {
                     codex_home: inventory.codex_home,
                     target_os: inventory.source_os,
@@ -608,6 +726,7 @@ pub async fn build_restore_plan(
                     &target,
                     &projects_root,
                     conflict_resolution,
+                    &options,
                 )?;
                 state.grant_plan(plan.plan_id, backup_root)?;
                 if let Some(grant) = state.grants().plans.get_mut(&plan.plan_id) {
@@ -617,11 +736,29 @@ pub async fn build_restore_plan(
                         package.manifest.counts.clone(),
                     ));
                 }
-                Ok(Some(BuildRestorePlanResponse::Plan { plan }))
+                Ok(Some(BuildRestorePlanResponse::Plan {
+                    plan,
+                    configuration_differences,
+                }))
             }
         },
     )
     .await
+}
+
+fn project_mapping_key(
+    package: &PackagePreview,
+    project: &ProjectEntry,
+    codex_home: &Path,
+) -> Result<String, RehomeError> {
+    let key = serde_json::to_vec(&(
+        package.manifest.source_device_id,
+        project.project_id,
+        &project.source_path,
+        codex_home,
+    ))
+    .map_err(|error| RehomeError::new(ErrorCode::RestoreFailed, error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(key)))
 }
 
 #[tauri::command]
@@ -631,6 +768,7 @@ pub async fn apply_restore(
 ) -> Result<RestoreReport, SupportFailure> {
     let state = state.inner().clone();
     run_supported(Stage::Apply, state.support.clone(), move |snapshot| {
+        ensure_codex_desktop_is_closed()?;
         let claim = state.claim_plan(selection.plan_id)?;
         if let Some((source_os, schema, counts)) = &claim.package_facts {
             snapshot.source_os = Some(*source_os);
@@ -865,11 +1003,63 @@ pub async fn open_restored_thread(
     .await
 }
 
+fn selected_project_references(
+    inventory: &CodexInventory,
+    selection: &CreatePackageSelection,
+) -> Result<Vec<ProjectEntry>, RehomeError> {
+    let conversation_ids: HashSet<_> = selection.conversation_ids.iter().copied().collect();
+    let mut project_ids: HashSet<_> = inventory
+        .conversations
+        .iter()
+        .filter(|conversation| conversation_ids.contains(&conversation.task_id))
+        .filter_map(|conversation| conversation.project_id)
+        .collect();
+    // A logical project can own several workspaces; map every referenced root.
+    if let Some(database) = inventory.state_db_path.as_deref() {
+        let current = crate::core::projects::current_threads(database)?;
+        for (id, row) in current
+            .iter()
+            .filter(|(id, _)| conversation_ids.contains(id))
+        {
+            let _ = id;
+            if let Some(roots) = row
+                .get(crate::core::projects::DESCRIPTOR)
+                .and_then(|project| project.get("workspace_roots"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for root in roots.iter().filter_map(serde_json::Value::as_str) {
+                    for project in &inventory.projects {
+                        if Path::new(&project.source_path) == Path::new(root) {
+                            project_ids.insert(project.project_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(inventory
+        .projects
+        .iter()
+        .filter(|project| project_ids.contains(&project.project_id))
+        .cloned()
+        .collect())
+}
+
 pub(crate) fn resolve_create_package_request(
     inventory: &CodexInventory,
     selection: CreatePackageSelection,
     output_path: PathBuf,
 ) -> Result<CreatePackageRequest, RehomeError> {
+    if !selection.include_project_files
+        && (!selection.skill_ids.is_empty()
+            || !selection.plugin_ids.is_empty()
+            || !selection.generated_image_ids.is_empty())
+    {
+        return Err(selection_failed(
+            ErrorCode::ProjectConflict,
+            "session-only export cannot include Skills, plugins, or generated files",
+        ));
+    }
     let selected_projects = selection
         .project_ids
         .iter()
@@ -893,8 +1083,7 @@ pub(crate) fn resolve_create_package_request(
             projects_by_id
                 .get(project_id)
                 .and_then(|project| {
-                    project
-                        .source_available
+                    (project.source_available || !selection.include_project_files)
                         .then(|| PathBuf::from(&project.source_path))
                 })
                 .ok_or_else(|| {
@@ -907,6 +1096,11 @@ pub(crate) fn resolve_create_package_request(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let project_paths = if selection.include_project_files {
+        project_paths
+    } else {
+        Vec::new()
+    };
 
     let conversations_by_id = inventory
         .conversations
@@ -1379,8 +1573,8 @@ fn tasklist_csv_has_process(output: &str, process_name: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn codex_desktop_is_running() -> Result<bool, RehomeError> {
-    let output = Command::new("pgrep")
-        .args(["-f", "/Codex.app/"])
+    let output = Command::new("/usr/bin/pgrep")
+        .args(["-f", "/(Codex|ChatGPT)\\.app/|(^|/)codex([[:space:]]|$)"])
         .output()
         .map_err(|error| {
             RehomeError::new(
@@ -1388,7 +1582,14 @@ fn codex_desktop_is_running() -> Result<bool, RehomeError> {
                 format!("could not check whether Codex is running: {error}"),
             )
         })?;
-    Ok(output.status.success())
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(RehomeError::new(
+            ErrorCode::CodexRunning,
+            "could not check whether Codex is running",
+        )),
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

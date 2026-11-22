@@ -12,6 +12,17 @@ Move selected Codex Desktop projects, conversations, Skills, Plugins, and genera
 
 [Download ReHome Desktop](https://github.com/CalebYcj/codex-rehome/releases) · [Open Codex ReHome Skill](https://github.com/CalebYcj/codex-rehome-skill)
 
+## Migrate conversations only
+
+Choose **Conversations only** on export and select the chats to carry. The resulting `.rehome` file preserves the chats, archive status, supported attachments, pins, groups, manual order, and project membership. Map each referenced project to an existing folder on the target. ReHome remembers these folders for later imports. Review settings differences and conversation conflicts, then fully quit Codex before applying the import.
+
+- The preview defers conversations whose ID matches different local content, along with forks that require them. The original package retains the deferred conversations.
+- The package can carry images and file attachments stored in Codex's managed directories. Paths in messages, tool output, and external file links remain references.
+- The settings comparison covers the CLI version, top-level model and provider settings in `config.toml`, enabled MCP server names, and detected skill names. Settings remain local to each computer.
+- Reopen Codex to verify that the conversations appear in the expected location and can be continued. Use synthetic conversations for rehearsals and export only authorized conversations for the actual move.
+
+Paginated history was rehearsed with Codex CLI `0.169.0-alpha.11.1` and isolated data. Before the first import, start Codex on the destination and create a test conversation to initialize its databases. Export or preview reports incompatible history schemas before changing conversation data.
+
 ## Move in three steps
 
 1. **Source computer**: Open ReHome Desktop, choose projects, conversations, and other content, then create a `.rehome` file.

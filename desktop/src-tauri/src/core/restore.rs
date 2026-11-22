@@ -8,6 +8,7 @@ use crate::core::{
         register_project_with_detected_cli,
     },
     error::{ErrorCode, RehomeError},
+    history_export::HISTORY_SOURCE,
     models::{
         ChangeKind, PendingRecovery, ProjectRegistration, RecoveryStatus, ReferenceRewriteKind,
         RegistrationStatus, RestoreOptions, RestorePlan, RestoreReport, RollbackReport, SourceOs,
@@ -178,6 +179,11 @@ fn apply_transaction(
     restored_files += (bridge.sessions_written
         + bridge.index_entries_merged
         + bridge.sqlite_threads_imported) as u64;
+    restored_files += u64::from(
+        plan.operations
+            .iter()
+            .any(|operation| operation.package_source == HISTORY_SOURCE),
+    );
     restored_bytes += changed_target_bytes(plan)?;
 
     update_status(transaction, RecoveryStatus::Verifying)?;
@@ -325,6 +331,7 @@ fn apply_regular_files(
 fn is_bridge_operation(plan: &RestorePlan, source: &str) -> bool {
     source == SESSION_INDEX_SOURCE
         || source == THREAD_METADATA_SOURCE
+        || source == HISTORY_SOURCE
         || plan
             .sessions
             .iter()
@@ -522,6 +529,7 @@ fn verify_bridge_metadata(
                 &std::collections::HashMap::new(),
             )? {
                 mapping_valid &= crate::core::projects::verify_restored(&db, &row)?;
+                mapping_valid &= crate::core::sidebar::verify_restored(&db, &row)?;
             }
         }
         sqlite_valid = plan.sessions.iter().all(|session| {
@@ -703,7 +711,9 @@ fn register_projects(
     verified: &VerifiedPackage,
     registrar: &mut impl FnMut(SourceOs, &Path) -> RegistrationStatus,
 ) -> Vec<ProjectRegistration> {
-    if !options.register_projects {
+    if !options.register_projects
+        || verified.preview.manifest.mode == crate::core::models::PackageMode::SessionsOnly
+    {
         return Vec::new();
     }
     let target_os = if cfg!(target_os = "macos") {

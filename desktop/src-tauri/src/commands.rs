@@ -139,6 +139,7 @@ mod tests {
             inventory_fixture();
         let output = PathBuf::from("C:\\selected-by-native-dialog\\handoff.rehome");
         let selection = CreatePackageSelection {
+            include_project_files: true,
             project_ids: vec![selected_project],
             conversation_ids: vec![matching_chat, unassociated_chat],
             skill_ids: vec![],
@@ -162,6 +163,7 @@ mod tests {
         let conversation_only = resolve_create_package_request(
             &inventory,
             CreatePackageSelection {
+                include_project_files: true,
                 project_ids: vec![],
                 conversation_ids: vec![mismatched_chat],
                 ..selection
@@ -175,6 +177,7 @@ mod tests {
         let unknown_project_error = resolve_create_package_request(
             &inventory,
             CreatePackageSelection {
+                include_project_files: true,
                 project_ids: vec![Uuid::new_v4()],
                 conversation_ids: vec![unassociated_chat],
                 skill_ids: vec![],
@@ -198,6 +201,7 @@ mod tests {
         let error = resolve_create_package_request(
             &inventory,
             CreatePackageSelection {
+                include_project_files: true,
                 project_ids: vec![selected_project],
                 conversation_ids: vec![matching_chat],
                 skill_ids: vec![],
@@ -273,6 +277,7 @@ mod tests {
         let request = resolve_create_package_request(
             &inventory,
             CreatePackageSelection {
+                include_project_files: true,
                 project_ids: vec![discovered_project.project_id],
                 conversation_ids: vec![discovered_conversation.task_id],
                 skill_ids: vec![],

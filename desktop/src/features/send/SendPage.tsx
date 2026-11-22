@@ -62,6 +62,7 @@ export default function SendPage({
   const { t } = useI18n();
   const [step, setStep] = useState<"selection" | "review">("selection");
   const [search, setSearch] = useState("");
+  const [includeProjectFiles, setIncludeProjectFiles] = useState(true);
   const [projects, setProjects] = useState<Set<string>>(new Set());
   const [conversations, setConversations] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -126,25 +127,22 @@ export default function SendPage({
   }, [inventory, conversations]);
   const hasSelectableContent = Boolean(
     inventory &&
-      inventory.projects.filter((project) => project.source_available).length +
-        exportableConversations.length +
-        inventory.skills.length +
-        inventory.plugins.length +
-        inventory.generated_images.length >
-        0,
+      exportableConversations.length + (includeProjectFiles ?
+        inventory.projects.filter((project) => project.source_available).length +
+        inventory.skills.length + inventory.plugins.length + inventory.generated_images.length : 0) > 0,
   );
   const allContentSelected = Boolean(
     inventory &&
       hasSelectableContent &&
-      inventory.projects
+      (!includeProjectFiles || inventory.projects
         .filter((project) => project.source_available)
-        .every((project) => projects.has(project.project_id)) &&
+        .every((project) => projects.has(project.project_id))) &&
       exportableConversations.every((conversation) =>
         conversations.has(conversation.task_id),
       ) &&
-      inventory.skills.every((skill) => skills.has(skill.content_id)) &&
+      (!includeProjectFiles || (inventory.skills.every((skill) => skills.has(skill.content_id)) &&
       inventory.plugins.every((plugin) => plugins.has(plugin.content_id)) &&
-      inventory.generated_images.every((image) => images.has(image.content_id)),
+      inventory.generated_images.every((image) => images.has(image.content_id)))),
   );
   const canCreate = Boolean(
     inventory && hasContent && !busy && !dependencies.cycle && dependencies.missing.length === 0 &&
@@ -181,6 +179,15 @@ export default function SendPage({
   }
 
   function toggleProject(projectId: string, items: ConversationEntry[]) {
+    if (!includeProjectFiles) {
+      const exportable = items.filter((item) => !isUnsupportedConversation(item, inventory?.unsupported_conversation_paths));
+      const selected = exportable.length > 0 && exportable.every((item) => conversations.has(item.task_id));
+      const next = new Set(conversations);
+      for (const item of exportable) { if (selected) next.delete(item.task_id); else next.add(item.task_id); }
+      setConversations(next);
+      setExpanded((current) => new Set(current).add(projectId));
+      return;
+    }
     const nextProjects = new Set(projects);
     const nextConversations = new Set(conversations);
     if (nextProjects.has(projectId)) {
@@ -212,7 +219,7 @@ export default function SendPage({
     setProjects(
       new Set(
         inventory.projects
-          .filter((project) => project.source_available)
+          .filter((project) => includeProjectFiles && project.source_available)
           .map((project) => project.project_id),
       ),
     );
@@ -221,11 +228,9 @@ export default function SendPage({
         exportableConversations.map((conversation) => conversation.task_id),
       ),
     );
-    setSkills(new Set(inventory.skills.map((skill) => skill.content_id)));
-    setPlugins(new Set(inventory.plugins.map((plugin) => plugin.content_id)));
-    setImages(
-      new Set(inventory.generated_images.map((image) => image.content_id)),
-    );
+    setSkills(new Set(includeProjectFiles ? inventory.skills.map((skill) => skill.content_id) : []));
+    setPlugins(new Set(includeProjectFiles ? inventory.plugins.map((plugin) => plugin.content_id) : []));
+    setImages(new Set(includeProjectFiles ? inventory.generated_images.map((image) => image.content_id) : []));
   }
 
   async function handleCreate() {
@@ -236,7 +241,8 @@ export default function SendPage({
     onOperationStart();
     try {
       const created = await createPackage({
-        project_ids: [...projects],
+        ...(!includeProjectFiles ? { include_project_files: false } : {}),
+        project_ids: includeProjectFiles ? [...projects] : [],
         conversation_ids: [...conversations],
         skill_ids: [...skills],
         plugin_ids: [...plugins],
@@ -317,7 +323,7 @@ export default function SendPage({
   const summary = t(
     "{projects} 个项目 · {conversations} 个对话 · {skills} 个 Skills",
     {
-      projects: projects.size,
+      projects: includeProjectFiles ? projects.size : projectGroups.filter((project) => project.conversations.some((conversation) => conversations.has(conversation.task_id))).length,
       conversations: conversations.size,
       skills: skills.size,
     },
@@ -419,6 +425,13 @@ export default function SendPage({
       )}
       {step === "selection" ? (
         <>
+          <label className="confirmation-row">
+            <input type="checkbox" checked={!includeProjectFiles} onChange={(event) => {
+              setIncludeProjectFiles(!event.target.checked);
+              setProjects(new Set()); setSkills(new Set()); setPlugins(new Set()); setImages(new Set());
+            }} />
+            <span><strong>{t("只迁移会话")}</strong><small>{t("保留项目归属；在目标电脑选择已有项目目录，不复制项目文件、Skills 或插件。")}</small></span>
+          </label>
           <div className="selection-toolbar">
             <label className="search-field">
               <input
@@ -454,10 +467,10 @@ export default function SendPage({
                   key={project.project_id}
                   name={project.name}
                   path={formatDisplayPath(project.source_path)}
-                  fileCount={project.file_count}
-                  sourceAvailable={project.source_available}
+                  fileCount={includeProjectFiles ? project.file_count : null}
+                  sourceAvailable={!includeProjectFiles || project.source_available}
                   conversations={project.conversations}
-                  projectSelected={projects.has(project.project_id)}
+                  projectSelected={includeProjectFiles ? projects.has(project.project_id) : project.conversations.some((item) => !isUnsupportedConversation(item, inventory?.unsupported_conversation_paths)) && project.conversations.filter((item) => !isUnsupportedConversation(item, inventory?.unsupported_conversation_paths)).every((item) => conversations.has(item.task_id))}
                   expanded={expanded.has(project.project_id) || Boolean(query)}
                   selectedConversations={conversations}
                   onToggleProject={() =>
@@ -513,7 +526,7 @@ export default function SendPage({
               )}
             </div>
           </section>
-          <div className="optional-content-list">
+          {includeProjectFiles && <div className="optional-content-list">
             <OptionalContentGroup
               id="skills"
               title="Skills"
@@ -554,7 +567,7 @@ export default function SendPage({
                 onChange={setImages}
               />
             </details>
-          </div>
+          </div>}
           {inventory && inventory.warnings.length > 0 && (
             <details className="technical-details">
               <summary>{t("查看检测提示")}</summary>
@@ -613,14 +626,15 @@ export default function SendPage({
             </span>
           </div>
           <p className="privacy-note">{t("登录信息和敏感文件不会打包。")}</p>
+          {!includeProjectFiles && <p className="privacy-note">{t("只迁移会话与项目归属，项目文件不会进入迁移包。")}</p>}
           <p className="muted">{t("体积将在创建时确定。")}</p>
-            <p className="muted">{t(
+            {includeProjectFiles && <p className="muted">{t(
               "勾选项目会包含项目文件。导出需要暂存副本和迁移包的空间；通常暂存在保存位置，若保存到所选内容内或磁盘不支持私有权限，则使用本机缓存目录。",
-            )}</p>
-          <details className="technical-details">
+            )}</p>}
+          {includeProjectFiles && <details className="technical-details">
             <summary>{t("如何分批迁移？")}</summary>
             <p>{t("每次只选一部分对话，分别保存成不同的迁移包。同一项目分批迁移时，每批都保留项目勾选，并在新电脑导入到同一个项目保存位置。未变化的项目文件会跳过；有变化的文件仍需确认冲突。")}</p>
-          </details>
+          </details>}
           <details className="technical-details">
             <summary>{t("查看排除内容")}</summary>
             <p>

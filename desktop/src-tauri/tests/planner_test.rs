@@ -7,7 +7,10 @@ use rehome_desktop_lib::core::{
         SessionAction, SourceOs, TargetInventory,
     },
     package::inspect_package,
-    planner::{build_restore_plan, build_restore_plan_with_conflict_resolution},
+    planner::{
+        build_restore_plan, build_restore_plan_with_conflict_resolution,
+        build_restore_plan_with_options, RestorePlanningOptions,
+    },
 };
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
@@ -123,6 +126,7 @@ fn restores_global_agent_skills_to_the_target_user_home() -> Result<(), Box<dyn 
         source_device_id: Uuid::nil(),
         mode: PackageMode::Full,
         parent_checkpoint: None,
+        source_configuration: None,
         counts: ContentCounts {
             skills: 1,
             ..ContentCounts::default()
@@ -295,6 +299,68 @@ fn existing_skill_with_different_content_remains_a_conflict() -> Result<(), Box<
         ChangeKind::Conflict
     );
     assert_eq!(plan.conflict_count, 1);
+    Ok(())
+}
+
+#[test]
+fn defers_a_divergent_session_without_rewriting_its_metadata_or_blocking_other_sessions(
+) -> Result<(), Box<dyn Error>> {
+    let mut fixture = shared_metadata_fixture()?;
+    let existing = fixture.preview.manifest.conversations[0].clone();
+    let existing_path = fixture
+        .target
+        .codex_home
+        .join(existing.archive_path.strip_prefix("codex/").unwrap());
+    let fresh = &fixture.preview.manifest.conversations[1];
+    let fresh_path = fixture
+        .target
+        .codex_home
+        .join(fresh.archive_path.strip_prefix("codex/").unwrap());
+    fs::remove_file(fresh_path)?;
+    fixture
+        .target
+        .conversations
+        .retain(|chat| chat.task_id != fresh.task_id);
+    let db_path = fixture.target.codex_home.join("state_5.sqlite");
+    Connection::open(&db_path)?.execute(
+        "DELETE FROM threads WHERE id = ?1",
+        [fresh.task_id.to_string()],
+    )?;
+    let local_history = fs::read(&existing_path)?;
+
+    let plan = build_restore_plan_with_options(
+        &fixture.preview,
+        &fixture.target,
+        &fixture.projects_root,
+        None,
+        &RestorePlanningOptions {
+            defer_conflicting_conversations: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert_eq!(plan.deferred_conversations.len(), 1);
+    assert_eq!(plan.deferred_conversations[0].task_id, existing.task_id);
+    assert_eq!(plan.sessions.len(), 1);
+    assert_eq!(plan.sessions[0].action, SessionAction::Import);
+    assert!(!plan
+        .operations
+        .iter()
+        .any(|op| op.package_source == existing.archive_path));
+
+    apply_bridge_plan(&plan)?;
+    assert_eq!(fs::read(existing_path)?, local_history);
+    assert!(plan.sessions[0].target.is_file());
+    let index = fs::read_to_string(fixture.target.codex_home.join("session_index.jsonl"))?;
+    assert!(!index.contains(&existing.task_id.to_string()));
+    assert!(index.contains(&plan.sessions[0].source_task_id.to_string()));
+    let db = Connection::open(db_path)?;
+    let ids: Vec<String> = db
+        .prepare("SELECT id FROM threads")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert!(ids.contains(&fresh.task_id.to_string()));
+    assert!(!ids.contains(&existing.task_id.to_string()));
     Ok(())
 }
 
@@ -1542,6 +1608,7 @@ fn planner_fixture(target_os: Option<SourceOs>) -> Result<PlannerFixture, Box<dy
         source_device_id: Uuid::nil(),
         mode: PackageMode::Full,
         parent_checkpoint: None,
+        source_configuration: None,
         counts: ContentCounts {
             projects: 1,
             project_files: 1,
@@ -1691,6 +1758,7 @@ fn shared_metadata_fixture_with_names(same_names: bool) -> Result<PlannerFixture
         source_device_id: Uuid::nil(),
         mode: PackageMode::Full,
         parent_checkpoint: None,
+        source_configuration: None,
         counts: ContentCounts {
             projects: 2,
             project_files: 2,
@@ -1976,6 +2044,7 @@ fn project_preview(root: &Path, duplicate_target: bool) -> Result<PackagePreview
         source_device_id: Uuid::nil(),
         mode: PackageMode::Full,
         parent_checkpoint: None,
+        source_configuration: None,
         counts: ContentCounts {
             projects: projects.len() as u64,
             project_files: projects.len() as u64,

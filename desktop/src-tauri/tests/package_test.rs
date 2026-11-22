@@ -905,6 +905,25 @@ fn rejects_unsupported_schema_before_checksum_validation() -> Result<(), Box<dyn
 }
 
 #[test]
+fn session_only_package_rejects_settings_even_when_checksums_are_valid(
+) -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("settings.rehome");
+    let mut manifest = test_manifest(1);
+    manifest.mode = PackageMode::SessionsOnly;
+    write_valid_test_package(
+        &package,
+        &manifest,
+        &[("codex/config.toml", b"model = 'fixture'")],
+    )?;
+    assert_error_message_contains(
+        inspect_package(&package),
+        "unexpected payload: codex/config.toml",
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_checksum_mismatch_with_a_stable_error_code() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().join("mismatch.rehome");
@@ -1339,6 +1358,7 @@ fn test_manifest(schema_version: u32) -> PackageManifest {
         source_device_id: Uuid::nil(),
         mode: PackageMode::Full,
         parent_checkpoint: None,
+        source_configuration: None,
         counts: ContentCounts::default(),
         projects: vec![],
         conversations: vec![],

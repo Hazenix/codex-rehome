@@ -25,6 +25,7 @@ fn manifest_round_trip() {
         source_device_id: Uuid::nil(),
         mode: PackageMode::Full,
         parent_checkpoint: None,
+        source_configuration: None,
         counts: ContentCounts::default(),
         projects: vec![],
         conversations: vec![],
@@ -52,6 +53,7 @@ fn populated_manifest_preserves_source_syntax_and_portable_archive_paths() {
         source_device_id: Uuid::nil(),
         mode: PackageMode::Full,
         parent_checkpoint: None,
+        source_configuration: None,
         counts: ContentCounts {
             projects: 1,
             project_files: 1,
@@ -230,6 +232,7 @@ fn restore_and_recovery_contracts_use_typed_state() {
         projects_root: PathBuf::from(r"C:\Users\NewUser\Documents"),
         operations: vec![operation.clone()],
         sessions: vec![],
+        deferred_conversations: vec![],
         reference_rewrites: vec![],
         bridge_verification: Default::default(),
         conflict_count: 0,

@@ -1,5 +1,6 @@
 use crate::core::{
     error::{ErrorCode, RehomeError},
+    history_export::HISTORY_SOURCE,
     models::{
         ChangeKind, PlannedOperation, PlannedSession, ReferenceRewrite, RegistrationStatus,
         RestorePlan, SessionAction, SourceOs,
@@ -21,13 +22,15 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{self, Read, Write},
+    io::{self, BufReader, Read, Seek, Write},
     path::Path,
     path::PathBuf,
     process::Command,
     time::Duration,
 };
 use uuid::Uuid;
+
+pub(crate) const HISTORY_DATABASE: &str = "thread_history_1.sqlite";
 
 const INDEX_IMPORT_FIELDS: &[&str] = &[
     "archived",
@@ -67,6 +70,20 @@ const THREAD_IMPORT_FIELDS: &[&str] = &[
     "has_user_event",
     "preview",
     "history_mode",
+    "name",
+    "is_pinned",
+    "thread_section_id",
+    "section_position",
+    "section_entered_at_ms",
+    "archived_at",
+    "creator_user_id",
+    "creator_account_id",
+    "thread_source",
+    "originator",
+    "created_at_ms",
+    "updated_at_ms",
+    "recency_at",
+    "recency_at_ms",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,11 +227,14 @@ fn macos_cli_candidates(application_dirs: &[PathBuf], running_exes: &[PathBuf]) 
         };
         if bundle.ends_with("ChatGPT.app") || bundle.ends_with("Codex.app") {
             candidates.push(contents.join("Resources/codex"));
+            candidates.push(contents.join("Resources/codex-cli/bin/codex"));
         }
     }
     for root in application_dirs {
         for app in ["ChatGPT.app", "Codex.app"] {
-            candidates.push(root.join(app).join("Contents/Resources/codex"));
+            let resources = root.join(app).join("Contents/Resources");
+            candidates.push(resources.join("codex"));
+            candidates.push(resources.join("codex-cli/bin/codex"));
         }
     }
     let mut seen = HashSet::new();
@@ -390,11 +410,50 @@ fn apply_bridge_plan_with_lock_token(
         sqlite_threads_imported = import_result?;
     }
 
+    if let Some(operation) = operation_for(plan, HISTORY_SOURCE) {
+        ensure_writable_change(operation)?;
+        if operation.target != plan.target_codex_home.join(HISTORY_DATABASE) {
+            return Err(restore_failed(
+                "invalid target Codex paginated history database",
+            ));
+        }
+        let mut sessions = Vec::new();
+        for session in &plan.sessions {
+            let payload = verified.session_payload(&session.package_source)?;
+            if session_history_mode(&payload.summary) == Some("paginated") {
+                sessions.push(session.clone());
+            }
+        }
+        let scratch = tempfile::tempdir_in(crate::core::package::private_app_temp_root()?)
+            .map_err(history_io_error)?;
+        let mut payload = tempfile::tempfile_in(scratch.path()).map_err(history_io_error)?;
+        verified
+            .open_payload_archive()?
+            .write_payload(HISTORY_SOURCE, &mut payload)?;
+        payload.rewind().map_err(history_io_error)?;
+        let _guard =
+            TargetReplacementGuard::acquire(&plan.target_codex_home, operation, lock_token)?;
+        reject_hard_linked_sqlite(&operation.target)?;
+        let result = crate::core::history_import::merge(
+            &operation.target,
+            BufReader::new(payload),
+            &sessions,
+            &plan.reference_rewrites,
+        );
+        // SQLite may checkpoint a pre-existing WAL even if the import fails.
+        on_applied(&operation.target)?;
+        result?;
+    }
+
     Ok(BridgeApplyReport {
         sessions_written,
         index_entries_merged,
         sqlite_threads_imported,
     })
+}
+
+fn history_io_error(error: io::Error) -> RehomeError {
+    restore_failed(format!("could not stage Codex paginated history: {error}"))
 }
 
 pub(crate) fn apply_file_source_for_transaction(
@@ -676,8 +735,15 @@ fn import_sqlite_threads_for_operation(
     }
     for row in &mut rows {
         crate::core::projects::prepare_import(&transaction, row)?;
+        crate::core::sidebar::prepare_import(&transaction, row)?;
         import_thread_row(&transaction, row, &schema)?;
+        crate::core::attachments::import_records(&transaction, row, rewrites)?;
         crate::core::projects::verify_member(&transaction, row)?;
+        if !crate::core::sidebar::verify_restored(&transaction, row)? {
+            return Err(restore_failed(
+                "restored sidebar metadata does not match its conversation",
+            ));
+        }
     }
     transaction.commit().map_err(|error| {
         restore_failed(format!("could not commit Codex thread import: {error}"))
@@ -717,11 +783,10 @@ pub(crate) fn package_thread_rows(
                 "thread metadata contains duplicate conversation IDs",
             ));
         }
-        let session = planned.get(&source_id).ok_or_else(|| {
-            package_invalid(format!(
-                "thread metadata references unplanned conversation {source_id}"
-            ))
-        })?;
+        let Some(session) = planned.get(&source_id) else {
+            // 冲突可延后处理；不修改未进入本次恢复计划的会话与分组。
+            continue;
+        };
         if !target_ids.insert(session.target_task_id) {
             return Err(restore_failed(
                 "restore plan contains duplicate target conversation IDs",
@@ -740,6 +805,12 @@ pub(crate) fn package_thread_rows(
         let descriptor = value
             .as_object_mut()
             .and_then(|v| v.remove(crate::core::projects::DESCRIPTOR));
+        let section = value
+            .as_object_mut()
+            .and_then(|v| v.remove(crate::core::sidebar::DESCRIPTOR));
+        let attachments = value
+            .as_object_mut()
+            .and_then(|v| v.remove("_rehome_file_attachments"));
         let mut line = serde_json::to_vec(&value).map_err(|error| {
             package_invalid(format!("could not encode bridge metadata row: {error}"))
         })?;
@@ -750,6 +821,12 @@ pub(crate) fn package_thread_rows(
             .as_object()
             .cloned()
             .ok_or_else(|| package_invalid("thread metadata row must be a JSON object"))?;
+        if let Some(section) = section {
+            object.insert(crate::core::sidebar::DESCRIPTOR.into(), section);
+        }
+        if let Some(attachments) = attachments {
+            object.insert("_rehome_file_attachments".into(), attachments);
+        }
         if let Some(mut descriptor) = descriptor {
             let roots = descriptor
                 .get("workspace_roots")
@@ -788,6 +865,7 @@ pub(crate) fn package_thread_rows(
         }
         result.push(object);
     }
+    crate::core::sidebar::validate_rows(&result)?;
     Ok(result)
 }
 
@@ -1012,7 +1090,7 @@ fn validate_operation_state(operation: &PlannedOperation) -> Result<(), RehomeEr
     }
 }
 
-fn reject_hard_linked_sqlite(path: &Path) -> Result<(), RehomeError> {
+pub(super) fn reject_hard_linked_sqlite(path: &Path) -> Result<(), RehomeError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         restore_failed(format!(
             "could not inspect target Codex state database {}: {error}",
@@ -1486,8 +1564,9 @@ mod registration_discovery_tests {
         );
         for root in ["/Applications", "/Users/test/Applications"] {
             for app in ["ChatGPT.app", "Codex.app"] {
-                assert!(candidates
-                    .contains(&Path::new(root).join(app).join("Contents/Resources/codex")));
+                let resources = Path::new(root).join(app).join("Contents/Resources");
+                assert!(candidates.contains(&resources.join("codex")));
+                assert!(candidates.contains(&resources.join("codex-cli/bin/codex")));
             }
         }
     }

@@ -1,8 +1,12 @@
+pub(crate) mod attachments;
 pub mod backup;
 pub mod bridge;
+pub mod configuration;
 pub mod discovery;
 pub mod error;
 pub mod exclusions;
+pub(crate) mod history_export;
+pub(crate) mod history_import;
 pub(crate) mod legacy;
 pub(crate) mod lineage;
 pub mod models;
@@ -15,4 +19,5 @@ pub mod restore;
 pub(crate) mod rollout;
 pub(crate) mod session;
 pub(crate) mod session_stream;
+pub(crate) mod sidebar;
 pub(crate) mod stable_fs;

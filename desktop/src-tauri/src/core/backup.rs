@@ -27,6 +27,34 @@ const TRANSACTIONS_DIRECTORY: &str = "transactions";
 const APPLIED_CHECKPOINTS_DIRECTORY: &str = "applied";
 const MAX_APPLIED_CHECKPOINT_BYTES: u64 = 64 * 1024;
 const SQLITE_SIDECARS: &[&str] = &["-wal", "-shm", "-journal"];
+const SQLITE_GROUPS: &[(&str, &str)] = &[
+    (
+        "codex/metadata/threads.json",
+        "codex/metadata/sqlite-sidecar",
+    ),
+    (
+        crate::core::history_export::HISTORY_SOURCE,
+        "codex/metadata/history-sqlite-sidecar",
+    ),
+];
+
+fn sqlite_sidecar_prefix(database_source: &str) -> Option<&'static str> {
+    SQLITE_GROUPS
+        .iter()
+        .find_map(|(source, prefix)| (*source == database_source).then_some(*prefix))
+}
+
+fn is_sqlite_group_sidecar(source: &str, prefix: &str) -> bool {
+    source
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| SQLITE_SIDECARS.contains(&suffix))
+}
+
+fn is_sqlite_sidecar(source: &str) -> bool {
+    SQLITE_GROUPS
+        .iter()
+        .any(|(_, prefix)| is_sqlite_group_sidecar(source, prefix))
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -191,7 +219,7 @@ pub(crate) fn prepare_transaction(
             &target,
         )?;
         validate_restore_target(&root, &target)?;
-        let operation = if package_source == "codex/metadata/threads.json" {
+        let operation = if sqlite_sidecar_prefix(&package_source).is_some() {
             backup_sqlite_database(
                 &objects,
                 index,
@@ -199,7 +227,7 @@ pub(crate) fn prepare_transaction(
                 target,
                 expected_hash.as_deref(),
             )?
-        } else if package_source.starts_with("codex/metadata/sqlite-sidecar") {
+        } else if is_sqlite_sidecar(&package_source) {
             backup_sqlite_sidecar(package_source, target)?
         } else {
             backup_target(
@@ -216,23 +244,23 @@ pub(crate) fn prepare_transaction(
     // An existing WAL or journal is folded into the self-contained database
     // backup. If a later operation fails before SQLite is written, rollback
     // must still restore that snapshot before removing the original sidecar.
-    let has_sqlite_sidecar = operations.iter().any(|operation| {
-        operation
-            .package_source
-            .starts_with("codex/metadata/sqlite-sidecar")
-            && operation.applied_state.is_some()
-    });
-    if has_sqlite_sidecar {
-        if let Some(index) = operations
-            .iter()
-            .position(|operation| operation.package_source == "codex/metadata/threads.json")
-        {
-            let applied_state = inspect_applied_state(&operations[index])?;
-            operations[index].applied_hash = match &applied_state {
-                AppliedState::File { hash, .. } => Some(hash.clone()),
-                AppliedState::Absent => None,
-            };
-            operations[index].applied_state = Some(applied_state);
+    for &(database_source, sidecar_prefix) in SQLITE_GROUPS {
+        let has_sqlite_sidecar = operations.iter().any(|operation| {
+            is_sqlite_group_sidecar(&operation.package_source, sidecar_prefix)
+                && operation.applied_state.is_some()
+        });
+        if has_sqlite_sidecar {
+            if let Some(index) = operations
+                .iter()
+                .position(|operation| operation.package_source == database_source)
+            {
+                let applied_state = inspect_applied_state(&operations[index])?;
+                operations[index].applied_hash = match &applied_state {
+                    AppliedState::File { hash, .. } => Some(hash.clone()),
+                    AppliedState::Absent => None,
+                };
+                operations[index].applied_state = Some(applied_state);
+            }
         }
     }
 
@@ -301,10 +329,9 @@ pub(crate) fn record_applied_mutation(
         .iter()
         .position(|operation| operation.target == target)
         .ok_or_else(|| restore_failed("mutated target is missing from the transaction journal"))?;
-    let include_sidecars =
-        prepared.journal.operations[index].package_source == "codex/metadata/threads.json";
+    let sidecar_prefix = sqlite_sidecar_prefix(&prepared.journal.operations[index].package_source);
     let mut indices = vec![index];
-    if include_sidecars {
+    if let Some(sidecar_prefix) = sidecar_prefix {
         indices.extend(
             prepared
                 .journal
@@ -312,9 +339,7 @@ pub(crate) fn record_applied_mutation(
                 .iter()
                 .enumerate()
                 .filter(|(_, operation)| {
-                    operation
-                        .package_source
-                        .starts_with("codex/metadata/sqlite-sidecar")
+                    is_sqlite_group_sidecar(&operation.package_source, sidecar_prefix)
                 })
                 .map(|(index, _)| index),
         );
@@ -328,16 +353,13 @@ pub(crate) fn record_applied_mutation(
         };
         prepared.journal.operations[index].applied_state = Some(applied_state);
     }
-    if include_sidecars {
+    if let Some(sidecar_prefix) = sidecar_prefix {
         let database_hash = prepared.journal.operations[index]
             .applied_hash
             .clone()
             .ok_or_else(|| restore_failed("applied SQLite database has no logical hash"))?;
         for operation in &mut prepared.journal.operations {
-            if operation
-                .package_source
-                .starts_with("codex/metadata/sqlite-sidecar")
-            {
+            if is_sqlite_group_sidecar(&operation.package_source, sidecar_prefix) {
                 operation.applied_database_hash = Some(database_hash.clone());
             }
         }
@@ -747,7 +769,7 @@ fn mutable_targets(
 ) -> Result<Vec<(String, PathBuf, Option<String>)>, RehomeError> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
-    let mut sqlite_database = None;
+    let mut sqlite_databases = Vec::new();
     for operation in &plan.operations {
         let writable = matches!(
             operation.action,
@@ -769,19 +791,15 @@ fn mutable_targets(
             operation.target.clone(),
             operation.expected_previous_hash.clone(),
         ));
-        if operation.package_source == "codex/metadata/threads.json" {
-            sqlite_database = Some(operation.target.clone());
+        if let Some(prefix) = sqlite_sidecar_prefix(&operation.package_source) {
+            sqlite_databases.push((operation.target.clone(), prefix));
         }
     }
-    if let Some(database) = sqlite_database {
+    for (database, sidecar_prefix) in sqlite_databases {
         for suffix in SQLITE_SIDECARS {
             let sidecar = sqlite_sidecar(&database, suffix);
             if seen.insert(sidecar.clone()) {
-                targets.push((
-                    format!("codex/metadata/sqlite-sidecar{suffix}"),
-                    sidecar,
-                    None,
-                ));
+                targets.push((format!("{sidecar_prefix}{suffix}"), sidecar, None));
             }
         }
     }
@@ -1257,11 +1275,7 @@ fn quarantine_target(
 
 fn rollback_order(journal: &TransactionJournal) -> Vec<usize> {
     let mut indices = (0..journal.operations.len()).collect::<Vec<_>>();
-    indices.sort_by_key(|index| {
-        journal.operations[*index]
-            .package_source
-            .starts_with("codex/metadata/sqlite-sidecar")
-    });
+    indices.sort_by_key(|index| is_sqlite_sidecar(&journal.operations[*index].package_source));
     indices
 }
 
@@ -1382,8 +1396,19 @@ fn validate_rollback_inputs(journal: &TransactionJournal) -> Result<(), RehomeEr
 }
 
 fn validate_pending_sqlite_group(journal: &TransactionJournal) -> Result<(), RehomeError> {
+    for &(database_source, sidecar_prefix) in SQLITE_GROUPS {
+        validate_pending_sqlite_database(journal, database_source, sidecar_prefix)?;
+    }
+    Ok(())
+}
+
+fn validate_pending_sqlite_database(
+    journal: &TransactionJournal,
+    database_source: &str,
+    sidecar_prefix: &str,
+) -> Result<(), RehomeError> {
     let has_pending_database = journal.operations.iter().any(|operation| {
-        operation.package_source == "codex/metadata/threads.json"
+        operation.package_source == database_source
             && operation.rollback_progress == RollbackProgress::Pending
             && operation.applied_state.is_some()
     });
@@ -1394,10 +1419,8 @@ fn validate_pending_sqlite_group(journal: &TransactionJournal) -> Result<(), Reh
     // changed member before reverting any project, index or database file.
     // Per-operation quarantine checks still protect later races and resumes.
     for operation in journal.operations.iter().filter(|operation| {
-        (operation.package_source == "codex/metadata/threads.json"
-            || operation
-                .package_source
-                .starts_with("codex/metadata/sqlite-sidecar"))
+        (operation.package_source == database_source
+            || is_sqlite_group_sidecar(&operation.package_source, sidecar_prefix))
             && operation.rollback_progress == RollbackProgress::Pending
     }) {
         match operation.applied_state.as_ref() {
@@ -1750,9 +1773,7 @@ fn validate_journal(journal: &TransactionJournal) -> Result<(), RehomeError> {
             BackupKind::Absent
                 if operation.backup_path.is_some()
                     || operation.original_hash.is_some()
-                        && !operation
-                            .package_source
-                            .starts_with("codex/metadata/sqlite-sidecar") =>
+                        && !is_sqlite_sidecar(&operation.package_source) =>
             {
                 return Err(rollback_failed(
                     "absent backup has unexpected file metadata",
@@ -2180,4 +2201,132 @@ fn restore_failed(message: impl Into<String>) -> RehomeError {
 
 fn rollback_failed(message: impl Into<String>) -> RehomeError {
     RehomeError::new(ErrorCode::RollbackFailed, message)
+}
+
+#[cfg(test)]
+mod sqlite_group_tests {
+    use super::*;
+    use crate::core::models::RestorePlan;
+    use std::error::Error;
+
+    #[test]
+    fn both_sqlite_databases_receive_independent_sidecar_targets() -> Result<(), Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        let codex = root.path().join("codex");
+        let operations = SQLITE_GROUPS.iter().enumerate().map(|(index, (source, _))| {
+            serde_json::json!({"package_source": source, "target": codex.join(format!("database-{index}.sqlite")), "expected_previous_hash": null, "action": "update", "rollback_required": true})
+        }).collect::<Vec<_>>();
+        let plan: RestorePlan = serde_json::from_value(serde_json::json!({
+            "plan_id": Uuid::new_v4(), "package_path": root.path().join("sample.rehome"),
+            "package_id": Uuid::new_v4(), "archive_hash": "sample", "target_codex_home": codex,
+            "projects_root": root.path().join("projects"), "operations": operations,
+            "sessions": [], "reference_rewrites": [], "conflict_count": 0, "required_bytes": 0
+        }))?;
+        let targets = mutable_targets(&plan)?;
+        assert_eq!(targets.len(), 8);
+        for &(source, prefix) in SQLITE_GROUPS {
+            let database = targets
+                .iter()
+                .find(|(candidate, _, _)| candidate == source)
+                .unwrap();
+            for suffix in SQLITE_SIDECARS {
+                assert!(targets.iter().any(|(candidate, path, _)| candidate
+                    == &format!("{prefix}{suffix}")
+                    && path == &sqlite_sidecar(&database.1, suffix)));
+            }
+        }
+        assert!(!is_sqlite_sidecar(
+            "codex/metadata/history-sqlite-sidecar-other"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn two_wal_snapshots_checkpoint_separately_and_restore_both_original_databases(
+    ) -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let codex = root.join("codex");
+        fs::create_dir(&codex)?;
+        let backup_root = root.join("backups");
+        let transaction_id = Uuid::new_v4();
+        let transaction_backup = backup_root.join(transaction_id.to_string());
+        let objects = transaction_backup.join("objects");
+        let checkpoints = transaction_backup.join(APPLIED_CHECKPOINTS_DIRECTORY);
+        fs::create_dir_all(&objects)?;
+        fs::create_dir(&checkpoints)?;
+        let mut operations = Vec::new();
+        let mut databases = Vec::new();
+        for (group, (source, prefix)) in SQLITE_GROUPS.iter().enumerate() {
+            let path = codex.join(format!("database-{group}.sqlite"));
+            let database = Connection::open(&path)?;
+            database.execute_batch("PRAGMA journal_mode=WAL;PRAGMA wal_autocheckpoint=0;CREATE TABLE sample(value TEXT);INSERT INTO sample VALUES('original');")?;
+            assert!(sqlite_sidecar(&path, "-wal").exists());
+            operations.push(backup_sqlite_database(
+                &objects,
+                operations.len(),
+                source.to_string(),
+                path.clone(),
+                None,
+            )?);
+            for suffix in SQLITE_SIDECARS {
+                operations.push(backup_sqlite_sidecar(
+                    format!("{prefix}{suffix}"),
+                    sqlite_sidecar(&path, suffix),
+                )?);
+            }
+            database.close().map_err(|(_, error)| error)?;
+            Connection::open(&path)?.execute("UPDATE sample SET value='imported'", [])?;
+            databases.push(path);
+        }
+        let mut prepared = PreparedTransaction {
+            journal: TransactionJournal {
+                transaction_id,
+                package_id: Uuid::new_v4(),
+                status: RecoveryStatus::Committed,
+                created_at: timestamp(),
+                operations,
+                backup_root,
+                target_codex_home: codex,
+                projects_root: root.join("projects"),
+                project_paths: vec![],
+                locks: vec![],
+            },
+            journal_path: root.join(format!("{transaction_id}.json")),
+            applied_checkpoints: checkpoints,
+        };
+        let first_group_before = prepared.journal.operations[..4].to_vec();
+        record_applied_mutation(&mut prepared, &databases[1])?;
+        assert_eq!(prepared.journal.operations[..4], first_group_before);
+        assert!(prepared.journal.operations[5..8]
+            .iter()
+            .all(|operation| operation.applied_database_hash.is_some()));
+        record_applied_mutation(&mut prepared, &databases[0])?;
+        validate_pending_sqlite_group(&prepared.journal)?;
+        // A new history WAL must be caught even when the primary state DB is untouched.
+        let unexpected_wal = sqlite_sidecar(&databases[1], "-wal");
+        fs::write(&unexpected_wal, "synthetic external write")?;
+        assert!(validate_pending_sqlite_group(&prepared.journal).is_err());
+        fs::remove_file(unexpected_wal)?;
+        // Keep this private fixture entirely under its temp root; public journal
+        // lookup separately enforces the application's managed storage path.
+        let mut recovered = prepared.journal.clone();
+        for operation in &mut recovered.operations {
+            operation.applied_hash = None;
+            operation.applied_state = None;
+            operation.applied_database_hash = None;
+        }
+        load_applied_checkpoints(&mut recovered)?;
+        assert_eq!(recovered.operations, prepared.journal.operations);
+        write_journal(&prepared.journal_path, &recovered)?;
+        let report = rollback_loaded(&prepared.journal_path, &mut recovered)?;
+        assert!(report.success);
+        for path in databases {
+            let value: String =
+                Connection::open(&path)?
+                    .query_row("SELECT value FROM sample", [], |row| row.get(0))?;
+            assert_eq!(value, "original");
+        }
+        Ok(())
+    }
 }

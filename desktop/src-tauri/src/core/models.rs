@@ -13,6 +13,7 @@ pub enum SourceOs {
 #[serde(rename_all = "snake_case")]
 pub enum PackageMode {
     Full,
+    SessionsOnly,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +98,8 @@ pub struct PackageManifest {
     pub source_device_id: Uuid,
     pub mode: PackageMode,
     pub parent_checkpoint: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_configuration: Option<crate::core::configuration::ConfigurationSummary>,
     pub counts: ContentCounts,
     pub projects: Vec<ProjectEntry>,
     pub conversations: Vec<ConversationEntry>,
@@ -203,6 +206,7 @@ pub enum ReferenceRewriteKind {
     ProjectPath,
     WorkspaceRoot,
     SessionPath,
+    AttachmentPath,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,6 +255,13 @@ pub struct BridgeVerificationRequirements {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeferredConversation {
+    pub task_id: Uuid,
+    pub title: String,
+    pub required_source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RestorePlan {
     pub plan_id: Uuid,
     pub package_path: PathBuf,
@@ -260,6 +271,8 @@ pub struct RestorePlan {
     pub projects_root: PathBuf,
     pub operations: Vec<PlannedOperation>,
     pub sessions: Vec<PlannedSession>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_conversations: Vec<DeferredConversation>,
     pub reference_rewrites: Vec<ReferenceRewrite>,
     #[serde(default)]
     pub bridge_verification: BridgeVerificationRequirements,
